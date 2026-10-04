@@ -29,6 +29,12 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * WebView + xterm.js 多终端界面。
+ *
+ * - 一个 WebView 里多个 xterm.js 实例，按 id 路由输入输出；
+ * - 侧边栏列出所有终端，点击切换，点「×」关闭，点「+」新建；
+ * - 长按 WebView 弹菜单：选择文本 / 全选并复制 / 粘贴 / 清屏 / 字号；
+ * - 选择模式下：底部工具栏切换为「复制选中 / 全选 / 取消」，
+ *   JS 捕获 touchstart/touchmove 换算成 buffer 行列做真实范围选择。
  */
 class TerminalUi(private val activity: Activity) {
 
@@ -50,6 +56,8 @@ class TerminalUi(private val activity: Activity) {
     private val sidebar: LinearLayout
     private val sessionList: LinearLayout
     private val scrim: View
+    private val mainBar: LinearLayout
+    private val selectBar: LinearLayout
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -63,6 +71,7 @@ class TerminalUi(private val activity: Activity) {
     @Volatile private var webReady = false
     @Volatile private var destroyed = false
     @Volatile private var ctrl = false
+    @Volatile private var selectMode = false
     private var ctrlButton: Button? = null
 
     private var currentId = -1
@@ -91,6 +100,7 @@ class TerminalUi(private val activity: Activity) {
         }
         wv.addJavascriptInterface(Bridge(), "Android")
         wv.loadUrl("file:///android_asset/terminal.html")
+        wv.isLongClickable = true
         wv.setOnLongClickListener {
             showTerminalMenu()
             true
@@ -111,16 +121,17 @@ class TerminalUi(private val activity: Activity) {
         web = createWebView()
         main.addView(web, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val bar = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(button("☰") { toggleSidebar() })
-        ctrlButton = button("Ctrl") { setCtrl(!ctrl) }.also { bar.addView(it) }
+        // ---- 默认工具栏 ----
+        mainBar = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        mainBar.addView(button("☰") { toggleSidebar() })
+        ctrlButton = button("Ctrl") { setCtrl(!ctrl) }.also { mainBar.addView(it) }
 
         fun raw(label: String, seq: String) {
-            bar.addView(button(label) { onKey(currentId, seq) })
+            mainBar.addView(button(label) { onKey(currentId, seq) })
         }
 
         fun jsCall(label: String, code: String) {
-            bar.addView(button(label) { if (!destroyed) web.evaluateJavascript(code, null) })
+            mainBar.addView(button(label) { if (!destroyed) web.evaluateJavascript(code, null) })
         }
 
         raw("Esc", "\u001B")
@@ -141,18 +152,48 @@ class TerminalUi(private val activity: Activity) {
         raw("~", "~")
         jsCall("A-", "fontDeltaActive(-1)")
         jsCall("A+", "fontDeltaActive(1)")
-        bar.addView(button("复制") { web.evaluateJavascript("copyAllActive()", null) })
-        bar.addView(button("粘贴") { paste() })
-        bar.addView(button("新建") { onNewSession() })
+        mainBar.addView(button("复制") { web.evaluateJavascript("copyAllActive()", null) })
+        mainBar.addView(button("选择") { enterSelectMode() })
+        mainBar.addView(button("粘贴") { paste() })
+        mainBar.addView(button("新建") { onNewSession() })
 
-        main.addView(
+        // ---- 选择模式工具栏 ----
+        selectBar = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            visibility = View.GONE
+            setBackgroundColor(Color.parseColor("#1E3A5F"))
+        }
+        selectBar.addView(
+            TextView(activity).apply {
+                text = "选择模式"
+                setTextColor(Color.WHITE)
+                textSize = 14f
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                gravity = Gravity.CENTER_VERTICAL
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        selectBar.addView(button("复制选中") { copySelectionAndExit() })
+        selectBar.addView(button("全选") { selectAllAndExit() })
+        selectBar.addView(button("取消") { exitSelectMode() })
+
+        // 用 FrameLayout 叠两个工具栏，切换时只改 visibility，不改变 WebView 高度。
+        val barHolder = FrameLayout(activity).apply {
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
+        }
+        barHolder.addView(
             HorizontalScrollView(activity).apply {
                 isHorizontalScrollBarEnabled = false
-                setBackgroundColor(Color.parseColor("#1E1E1E"))
-                addView(bar)
+                addView(mainBar)
             },
-            LinearLayout.LayoutParams(-1, -2)
+            FrameLayout.LayoutParams(-1, -2)
         )
+        barHolder.addView(
+            selectBar,
+            FrameLayout.LayoutParams(-1, -2)
+        )
+        main.addView(barHolder, LinearLayout.LayoutParams(-1, -2))
+
         root.addView(main, FrameLayout.LayoutParams(-1, -1))
 
         scrim = View(activity).apply {
@@ -268,6 +309,7 @@ class TerminalUi(private val activity: Activity) {
     }
 
     fun switchTab(id: Int) {
+        if (selectMode) exitSelectMode()
         currentId = id
         refreshActiveHighlight()
         if (webReady) web.evaluateJavascript("switchTerm($id)", null)
@@ -285,6 +327,45 @@ class TerminalUi(private val activity: Activity) {
 
     fun getCurrentId(): Int = currentId
     fun isPageReady(): Boolean = webReady
+
+    // ---------------------------------------------------------- 选择模式
+
+    /** 进入选择模式：WebView 放开长按，JS 开启 touchmove 拖选。 */
+    private fun enterSelectMode() {
+        if (destroyed || !webReady || currentId < 0) return
+        selectMode = true
+        mainBar.visibility = View.GONE
+        selectBar.visibility = View.VISIBLE
+        web.isLongClickable = false
+        web.setOnLongClickListener(null)
+        web.evaluateJavascript("enterSelectMode()", null)
+    }
+
+    /** 退出选择模式：恢复默认工具栏与长按监听。 */
+    private fun exitSelectMode() {
+        if (!selectMode) return
+        selectMode = false
+        selectBar.visibility = View.GONE
+        mainBar.visibility = View.VISIBLE
+        web.isLongClickable = true
+        web.setOnLongClickListener {
+            showTerminalMenu()
+            true
+        }
+        if (webReady) web.evaluateJavascript("exitSelectMode()", null)
+    }
+
+    private fun copySelectionAndExit() {
+        if (!webReady) return
+        web.evaluateJavascript("copySelectionActive()", null)
+        exitSelectMode()
+    }
+
+    private fun selectAllAndExit() {
+        if (!webReady) return
+        web.evaluateJavascript("copyAllActive()", null)
+        exitSelectMode()
+    }
 
     // ---------------------------------------------------------- 输出
 
@@ -374,15 +455,16 @@ class TerminalUi(private val activity: Activity) {
 
     private fun showTerminalMenu() {
         if (destroyed || currentId < 0) return
-        val items = arrayOf("全选并复制", "复制选中", "粘贴", "清屏", "字号 -", "字号 +")
+        val items = arrayOf("选择文本", "全选并复制", "复制选中", "粘贴", "清屏", "字号 -", "字号 +")
         AlertDialog.Builder(activity)
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> web.evaluateJavascript("copyAllActive()", null)
-                    1 -> web.evaluateJavascript("copySelectionActive()", null)
-                    2 -> paste()
-                    3 -> web.evaluateJavascript("clearActive()", null)
-                    4 -> web.evaluateJavascript("fontDeltaActive(-1)", null)
+                    0 -> enterSelectMode()
+                    1 -> web.evaluateJavascript("copyAllActive()", null)
+                    2 -> web.evaluateJavascript("copySelectionActive()", null)
+                    3 -> paste()
+                    4 -> web.evaluateJavascript("clearActive()", null)
+                    5 -> web.evaluateJavascript("fontDeltaActive(-1)", null)
                     else -> web.evaluateJavascript("fontDeltaActive(1)", null)
                 }
             }
@@ -400,7 +482,7 @@ class TerminalUi(private val activity: Activity) {
     inner class Bridge {
         @JavascriptInterface
         fun input(id: String, d: String) {
-            if (destroyed) return
+            if (destroyed || selectMode) return
             val i = id.toIntOrNull() ?: return
             onInput(i, applyCtrl(d))
         }
