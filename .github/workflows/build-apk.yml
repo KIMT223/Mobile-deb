@@ -1,0 +1,46 @@
+name: build-apk
+ 
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+ 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+ 
+      - name: 检查 proot 文件
+        run: |
+          ls -l app/src/main/jniLibs/arm64-v8a/
+          for f in libproot.so libproot-loader.so; do
+            test -f "app/src/main/jniLibs/arm64-v8a/$f" || { echo "缺少 $f，请先放进 app/src/main/jniLibs/arm64-v8a/"; exit 1; }
+          done
+ 
+      - name: 下载 xterm.js
+        run: |
+          mkdir -p /tmp/xt app/src/main/assets/xterm
+          cd /tmp/xt && npm init -y >/dev/null && npm install @xterm/xterm@5.5.0 @xterm/addon-fit@0.10.0
+          cd "$GITHUB_WORKSPACE"
+          cp /tmp/xt/node_modules/@xterm/xterm/lib/xterm.js app/src/main/assets/xterm/
+          cp /tmp/xt/node_modules/@xterm/xterm/css/xterm.css app/src/main/assets/xterm/
+          cp /tmp/xt/node_modules/@xterm/addon-fit/lib/addon-fit.js app/src/main/assets/xterm/
+          ls -l app/src/main/assets/xterm
+ 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+ 
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+ 
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+ 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MobileDebian-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
