@@ -6,78 +6,183 @@
 <link rel="stylesheet" href="xterm/xterm.css">
 <style>
   html, body { margin: 0; height: 100%; background: #121212; overflow: hidden; }
-  #t { position: absolute; top: 0; left: 0; right: 0; bottom: 0; padding: 4px; box-sizing: border-box; }
+  #terms { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .term {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    padding: 4px; box-sizing: border-box; display: none;
+  }
+  .term.active { display: block; }
 </style>
 </head>
 <body>
-<div id="t"></div>
+<div id="terms"></div>
 <script src="xterm/xterm.js"></script>
 <script src="xterm/addon-fit.js"></script>
 <script>
-  const term = new Terminal({
-    fontSize: 13,
-    fontFamily: 'monospace',
-    cursorBlink: true,
-    scrollback: 5000,
-    theme: { background: '#121212', foreground: '#d4d4d4' }
-  });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(document.getElementById('t'));
+  // id -> { term, fit, div }
+  const terms = new Map();
+  let activeId = null;
 
-  const ta = term.textarea;
-  if (ta) {
-    ta.setAttribute('autocorrect', 'off');
-    ta.setAttribute('autocapitalize', 'off');
-    ta.setAttribute('autocomplete', 'off');
-    ta.setAttribute('spellcheck', 'false');
-  }
-
-  // 桥接兜底：在普通浏览器里调试或桥未注入时不报错
+  // 桥接兜底：桥未注入时不报错
   function call(fn) {
     var b = window.Android;
     if (!b || typeof b[fn] !== 'function') return;
     try { b[fn].apply(b, Array.prototype.slice.call(arguments, 1)); } catch (e) {}
   }
-  function doFit() {
-    try { fit.fit(); } catch (e) {}
-    call('resize', term.cols, term.rows);
+
+  function createTerm(rawId) {
+    const id = String(rawId);
+    if (terms.has(id)) return;
+
+    const div = document.createElement('div');
+    div.className = 'term';
+    document.getElementById('terms').appendChild(div);
+
+    const term = new Terminal({
+      fontSize: 13,
+      fontFamily: 'monospace',
+      cursorBlink: true,
+      scrollback: 5000,
+      theme: { background: '#121212', foreground: '#d4d4d4' }
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(div);
+
+    const ta = term.textarea;
+    if (ta) {
+      ta.setAttribute('autocorrect', 'off');
+      ta.setAttribute('autocapitalize', 'off');
+      ta.setAttribute('autocomplete', 'off');
+      ta.setAttribute('spellcheck', 'false');
+    }
+
+    // 输入 -> Kotlin（带上 id）
+    term.onData(function (d) { call('input', id, d); });
+
+    terms.set(id, { term: term, fit: fit, div: div });
+
+    // 第一个终端自动激活
+    if (activeId === null) {
+      activeId = id;
+      div.classList.add('active');
+      try { fit.fit(); } catch (e) {}
+      term.focus();
+    } else {
+      // 后台终端也先 fit 一次，保证 cols/rows 有意义
+      try { fit.fit(); } catch (e) {}
+    }
+
+    // 告诉 Android 尺寸就绪
+    call('ready', id, term.cols, term.rows);
   }
-  let timer = null;
-  window.addEventListener('resize', function () {
-    clearTimeout(timer);
-    timer = setTimeout(doFit, 150);
-  });
-  document.addEventListener('click', function () { term.focus(); });
 
-  // 用户输入 -> Kotlin
-  term.onData(function (d) { call('input', d); });
+  function switchTerm(rawId) {
+    const id = String(rawId);
+    const t = terms.get(id);
+    if (!t) return;
+    activeId = id;
+    terms.forEach(function (v, k) {
+      if (k === id) v.div.classList.add('active');
+      else v.div.classList.remove('active');
+    });
+    try { t.fit.fit(); } catch (e) {}
+    t.term.focus();
+    call('resize', id, t.term.cols, t.term.rows);
+  }
 
-  // Kotlin 输出 (base64 字节) -> 终端
-  function w(b64) {
+  function closeTerm(rawId) {
+    const id = String(rawId);
+    const t = terms.get(id);
+    if (!t) return;
+    try { t.term.dispose(); } catch (e) {}
+    t.div.remove();
+    terms.delete(id);
+    if (activeId === id) activeId = null;
+  }
+
+  // 输出：Kotlin -> base64 字节 -> xterm
+  function w(rawId, b64) {
+    const t = terms.get(String(rawId));
+    if (!t) return;
     const s = atob(b64);
     const u = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
-    term.write(u);
-  }
-  function paste(t) { term.paste(t); }
-
-  // 兼容 xterm.js v4 (applicationCursorKeys) 与 v5 (applicationCursorKeysMode)
-  function arrow(c) {
-    var app = term.modes.applicationCursorKeysMode;
-    if (app === undefined) app = term.modes.applicationCursorKeys;
-    call('key', (app ? '\x1bO' : '\x1b[') + c);
+    t.term.write(u);
   }
 
-  function fontDelta(d) {
-    const s = Math.max(8, Math.min(28, term.options.fontSize + d));
-    term.options.fontSize = s;
-    doFit();
+  function pasteActive(text) {
+    if (activeId === null) return;
+    const t = terms.get(activeId);
+    if (t) t.term.paste(text);
   }
 
-  try { fit.fit(); } catch (e) {}
-  term.focus();
-  call('ready', term.cols, term.rows);
+  function clearActive() {
+    if (activeId === null) return;
+    const t = terms.get(activeId);
+    if (t) t.term.clear();
+  }
+
+  function copyAllActive() {
+    if (activeId === null) { call('onToast', '没有终端'); return; }
+    const t = terms.get(activeId);
+    if (!t) return;
+    t.term.selectAll();
+    const s = t.term.getSelection();
+    t.term.clearSelection();
+    if (s) call('onSelection', s);
+    else call('onToast', '无内容可复制');
+  }
+
+  function copySelectionActive() {
+    if (activeId === null) { call('onToast', '没有终端'); return; }
+    const t = terms.get(activeId);
+    if (!t) return;
+    const s = t.term.getSelection();
+    if (s) call('onSelection', s);
+    else call('onToast', '没有选中内容，长按选择「全选并复制」');
+  }
+
+  function arrowActive(c) {
+    if (activeId === null) return;
+    const t = terms.get(activeId);
+    if (!t) return;
+    var app = t.term.modes.applicationCursorKeysMode;
+    if (app === undefined) app = t.term.modes.applicationCursorKeys;
+    call('key', activeId, (app ? '\x1bO' : '\x1b[') + c);
+  }
+
+  function fontDeltaActive(d) {
+    if (activeId === null) return;
+    const t = terms.get(activeId);
+    if (!t) return;
+    const s = Math.max(8, Math.min(28, t.term.options.fontSize + d));
+    t.term.options.fontSize = s;
+    try { t.fit.fit(); } catch (e) {}
+    call('resize', activeId, t.term.cols, t.term.rows);
+  }
+
+  // 窗口尺寸变化：只 fit 当前终端
+  let timer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(timer);
+    timer = setTimeout(function () {
+      if (activeId === null) return;
+      const t = terms.get(activeId);
+      if (!t) return;
+      try { t.fit.fit(); } catch (e) {}
+      call('resize', activeId, t.term.cols, t.term.rows);
+    }, 150);
+  });
+
+  document.addEventListener('click', function () {
+    if (activeId === null) return;
+    const t = terms.get(activeId);
+    if (t) t.term.focus();
+  });
+
+  // 页面就绪，通知 Android 可以创建终端了
+  call('pageReady');
 </script>
 </body>
 </html>
