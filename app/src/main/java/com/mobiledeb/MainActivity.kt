@@ -109,7 +109,10 @@ class MainActivity : Activity() {
             return
         }
         val id = nextId++
-        val name = "终端 $id"
+
+        // 注意：这个变量不能叫 name，否则会遮蔽 Thread.name
+        val sessionName = "终端 $id"
+
         val term = DebianTerminal(
             ctx = applicationContext,
             onOutput = { ui.writeBytes(id, it) },
@@ -118,11 +121,11 @@ class MainActivity : Activity() {
                 ui.printText(id, "\n[进程已退出，code=$code]\n点侧边栏「+」新建，或「×」关闭。\n")
             },
         )
-        val s = Session(id, name, term)
+        val s = Session(id, sessionName, term)
         sessions.add(s)
-        ui.createTab(id, name, activate = true)
+        ui.createTab(id, sessionName, activate = true)
 
-        Thread {
+        val bootThread = Thread {
             DebianTerminal.SHARED_DIR.mkdirs()
             if (!rootfsPrepared) {
                 if (!term.isRootfsReady()) {
@@ -132,7 +135,9 @@ class MainActivity : Activity() {
                 rootfsPrepared = true
             }
             term.start()
-        }.apply { name = "debian-boot-$id" }.start()
+        }
+        // 用 also + it.name 显式指定接收者，避免任何作用域解析歧义
+        bootThread.also { it.name = "debian-boot-$id" }.start()
     }
 
     private fun closeSession(id: Int) {
