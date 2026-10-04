@@ -19,7 +19,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
-/**
+/*
  * PRoot + Debian 进程管理。
  *
  * 共享目录 /storage/emulated/0/mobile_deb/ 放 rootfs 压缩包 (.tar.gz/.tgz/.tar.xz)，
