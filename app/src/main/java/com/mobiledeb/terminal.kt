@@ -1,6 +1,7 @@
 package com.mobiledeb
 
 import android.content.Context
+import android.os.FileObserver
 import android.system.Os
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
@@ -12,8 +13,11 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 
 /**
  * PRoot + Debian 进程管理。
@@ -35,6 +39,8 @@ class DebianTerminal(
         private const val PATH_ENV =
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         private const val TTY_FILE = "tmp/.mdtty"
+        private const val TTY_BASENAME = ".mdtty"
+        private const val RESIZE_TIMEOUT_MS = 8000L
     }
 
     private val rootfsDir = File(ctx.filesDir, "rootfs")
@@ -44,8 +50,20 @@ class DebianTerminal(
     @Volatile private var supportsResize = false
     @Volatile private var wantedSize: Pair<Int, Int>? = null
     @Volatile private var appliedSize: Pair<Int, Int>? = null
-    private val writer = Executors.newSingleThreadExecutor()
-    private val resizer = Executors.newSingleThreadExecutor()
+
+    // stop() 后会关闭这两个 executor，start() 时按需重建，避免二次启动时被拒绝。
+    private val execLock = Any()
+    @Volatile private var writer: ExecutorService? = null
+    @Volatile private var resizer: ExecutorService? = null
+
+    private fun ensureExecutors() {
+        synchronized(execLock) {
+            val w = writer
+            if (w == null || w.isShutdown) writer = Executors.newSingleThreadExecutor()
+            val r = resizer
+            if (r == null || r.isShutdown) resizer = Executors.newSingleThreadExecutor()
+        }
+    }
 
     // ---------------------------------------------------------------- rootfs
 
@@ -112,38 +130,46 @@ class DebianTerminal(
         TarArchiveInputStream(decompressed).use { tar ->
             var e = tar.nextTarEntry
             while (e != null) {
+                // 兼容 PAX/GNU 长名头：commons-compress 会自动展开成普通 entry
                 val name = e.name.removePrefix("./")
                 if (name.isNotEmpty()) {
                     val out = File(dest, name)
                     // 防路径穿越
-                    if (!(out.parentFile?.canonicalPath + File.separator).startsWith(destPath)) {
+                    val outParent = out.parentFile
+                    if (outParent == null ||
+                        !(outParent.canonicalPath + File.separator).startsWith(destPath)
+                    ) {
                         e = tar.nextTarEntry
                         continue
                     }
                     when {
                         e.isDirectory -> {
                             out.mkdirs()
-                            Os.chmod(out.path, (e.mode and 0xFFF) or 0x1C0) // 至少 u+rwx
+                            // chmod 在个别文件系统上可能 EPERM/ENOTSUP，忽略失败
+                            runCatching { Os.chmod(out.path, (e.mode and 0xFFF) or 0x1C0) }
                         }
                         e.isSymbolicLink -> {
                             out.parentFile?.mkdirs()
                             out.delete()
-                            Os.symlink(e.linkName, out.path)
+                            val ok = runCatching { Os.symlink(e.linkName, out.path) }.isSuccess
+                            if (!ok) {
+                                // 退化成一个普通文本文件，内容为链接目标，至少不阻塞解压
+                                runCatching { out.writeText(e.linkName) }
+                            }
                         }
                         e.isLink -> {
                             out.parentFile?.mkdirs()
                             out.delete()
                             val target = File(dest, e.linkName.removePrefix("./"))
-                            try {
-                                Os.link(target.path, out.path)
-                            } catch (_: Exception) {
-                                target.copyTo(out, overwrite = true)
+                            val ok = runCatching { Os.link(target.path, out.path) }.isSuccess
+                            if (!ok) {
+                                runCatching { target.copyTo(out, overwrite = true) }
                             }
                         }
                         e.isFile -> {
                             out.parentFile?.mkdirs()
                             FileOutputStream(out).use { fos -> tar.copyTo(fos, 1 shl 16) }
-                            Os.chmod(out.path, (e.mode and 0xFFF) or 0x180) // 至少 u+rw
+                            runCatching { Os.chmod(out.path, (e.mode and 0xFFF) or 0x180) }
                         }
                         else -> { /* 设备节点等跳过，/dev 由 bind 提供 */ }
                     }
@@ -193,11 +219,15 @@ class DebianTerminal(
         if (root == null) {
             onMessage("rootfs 未就绪\n"); onExit(-1); return
         }
-        rootDir = root
         val cmd = prootBase(root, true)
         if (cmd == null) {
             onMessage("缺少 libproot.so（应放在 jniLibs/arm64-v8a/）\n"); onExit(-1); return
         }
+
+        ensureExecutors()
+        rootDir = root
+        appliedSize = null
+        supportsResize = false
 
         runCatching {
             val rc = File(root, "etc/resolv.conf")
@@ -206,8 +236,9 @@ class DebianTerminal(
                 rc.writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
             }
         }
+        // 确保 /tmp 存在，否则 script 的 `tty > /tmp/.mdtty` 会静默失败
+        File(root, "tmp").mkdirs()
         File(root, TTY_FILE).delete()
-        appliedSize = null
 
         // 用 script 在 rootfs 内分配 PTY，并记录 PTY 设备名，供后续调整窗口大小
         val hasScript = File(root, "usr/bin/script").exists()
@@ -216,6 +247,10 @@ class DebianTerminal(
             if (hasScript)
                 listOf("/usr/bin/script", "-qfc", "tty > /$TTY_FILE; exec /bin/bash -l", "/dev/null")
             else listOf("/bin/bash", "-i")
+
+        if (!supportsResize) {
+            onMessage("[提示] rootfs 缺少 script/stty，终端不会跟随窗口大小变化。\n")
+        }
 
         cmd += listOf(
             "-w", "/root",
@@ -258,8 +293,9 @@ class DebianTerminal(
 
     /** 向 stdin 写入原始文本（含控制字符）。 */
     fun write(text: String) {
+        val w = writer ?: return
         try {
-            writer.execute {
+            w.execute {
                 try {
                     stdin?.let { it.write(text.toByteArray(Charsets.UTF_8)); it.flush() }
                 } catch (_: IOException) {
@@ -277,8 +313,9 @@ class DebianTerminal(
     }
 
     private fun triggerResize() {
+        val r = resizer ?: return
         try {
-            resizer.execute { applyResize() }
+            r.execute { applyResize() }
         } catch (_: Exception) {
         }
     }
@@ -287,17 +324,11 @@ class DebianTerminal(
         val size = wantedSize ?: return
         if (size == appliedSize) return
         val root = rootDir ?: return
+        if (!isRunning()) return
 
-        // 等 bash 启动后写出 PTY 设备名（最多 ~8 秒）
-        var tty = ""
-        for (i in 0 until 15) {
-            if (!isRunning()) return
-            if (wantedSize != size) return // 窗口又变了，放弃本次，新任务会处理
-            tty = runCatching { File(root, TTY_FILE).readText().trim() }.getOrDefault("")
-            if (tty.startsWith("/dev/")) break
-            Thread.sleep(200)
-        }
-        if (!tty.startsWith("/dev/")) return
+        // 用 FileObserver + CountDownLatch 等 PTY 设备名出现；期间窗口又变了就放弃本次
+        val tty = waitForTtyFile(root, RESIZE_TIMEOUT_MS) { isRunning() && wantedSize == size }
+            ?: return
 
         val cmd = prootBase(root, false) ?: return
         cmd += listOf(
@@ -308,6 +339,7 @@ class DebianTerminal(
             val pb = ProcessBuilder(cmd).redirectErrorStream(true)
             applyEnv(pb)
             val p = pb.start()
+            // 排空输出，避免缓冲区满卡死
             p.inputStream.readBytes()
             if (p.waitFor() == 0) {
                 appliedSize = size
@@ -318,13 +350,75 @@ class DebianTerminal(
         }
     }
 
+    /**
+     * 等 /tmp/.mdtty 写出合法的 /dev/... 路径。
+     * - 先做一次同步检查；
+     * - 之后注册 FileObserver，文件创建/写入完成时立刻唤醒；
+     * - 每 200ms 也会重新读文件，防止 FileObserver 漏事件；
+     * - stillValid 返回 false 时提前退出。
+     */
+    private fun waitForTtyFile(root: File, timeoutMs: Long, stillValid: () -> Boolean): String? {
+        val ttyFile = File(root, TTY_FILE)
+        readTtyPath(ttyFile)?.let { return it }
+
+        val tmpDir = File(root, "tmp")
+        if (!tmpDir.isDirectory) return null
+
+        val latch = CountDownLatch(1)
+        @Suppress("DEPRECATION")
+        val observer = object : FileObserver(
+            tmpDir.absolutePath,
+            CREATE or MOVED_TO or CLOSE_WRITE or MODIFY
+        ) {
+            override fun onEvent(event: Int, path: String?) {
+                if (path == TTY_BASENAME) latch.countDown()
+            }
+        }
+        observer.startWatching()
+        try {
+            // 注册后再检查一次，避免在第一次检查和注册之间文件已经出现
+            readTtyPath(ttyFile)?.let { return it }
+
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                if (!stillValid()) return null
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) break
+                latch.await(minOf(remaining, 200L), TimeUnit.MILLISECONDS)
+                // 无论 latch 是否触发，都重新读文件，防止 FileObserver 漏事件
+                readTtyPath(ttyFile)?.let { return it }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            runCatching { observer.stopWatching() }
+        }
+        return null
+    }
+
+    private fun readTtyPath(f: File): String? = try {
+        if (!f.isFile) null
+        else f.readText().trim().takeIf { it.startsWith("/dev/") }
+    } catch (_: Exception) {
+        null
+    }
+
     fun isRunning() = process?.isAlive == true
 
     fun stop() {
-        runCatching { stdin?.close() }
-        process?.destroy()
+        val p = process
+        val s = stdin
         process = null
-        writer.shutdown()
-        resizer.shutdown()
+        stdin = null
+        runCatching { s?.close() }
+        runCatching { p?.destroy() }
+        runCatching { p?.destroyForcibly() }
+        // 关闭并释放 executor，下次 start() 时 ensureExecutors() 会重建
+        synchronized(execLock) {
+            runCatching { writer?.shutdownNow() }
+            runCatching { resizer?.shutdownNow() }
+            writer = null
+            resizer = null
+        }
     }
 }
