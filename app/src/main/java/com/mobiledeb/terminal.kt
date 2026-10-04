@@ -19,11 +19,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
-/*
- * PRoot + Debian 进程管理。
- *
- * 共享目录 /storage/emulated/0/mobile_deb/ 放 rootfs 压缩包 (.tar.gz/.tgz/.tar.xz)，
- * 首次启动解压到 filesDir/rootfs（内部存储支持 symlink 和 chmod，sdcard 不支持）。
+/**
+ * 单个 proot + Debian 会话。一个实例对应一个终端。
+ * 多个实例可以共享同一份 rootfs（filesDir/rootfs），rootfs 的首次解压由 MainActivity 全局保证只做一次。
  *
  * 终端大小同步：rootfs 里用 script 分配 PTY，并把 PTY 设备名写到 /tmp/.mdtty；
  * 窗口大小变化时另起一个 proot 执行 `stty -F <pty> rows R cols C`，内核会自动给 bash 发 SIGWINCH。
@@ -90,11 +88,10 @@ class DebianTerminal(
     fun prepareRootfs(progress: (String) -> Unit): Boolean {
         val archive = findArchive()
         if (archive == null) {
-            progress("未找到 rootfs 压缩包。\n请把 Debian rootfs (.tar.gz / .tar.xz) 放到:\n${SHARED_DIR.path}\n放好后点底部「重启」。\n")
+            progress("未找到 rootfs 压缩包。\n请把 Debian rootfs (.tar.gz / .tar.xz) 放到:\n${SHARED_DIR.path}\n放好后点侧边栏「+」重试。\n")
             return false
         }
         progress("解压 ${archive.name} …\n")
-        // 先解压到临时目录，成功后再替换，失败不会破坏已有 rootfs
         val tmp = File(ctx.filesDir, "rootfs.tmp")
         tmp.deleteRecursively()
         tmp.mkdirs()
@@ -130,11 +127,9 @@ class DebianTerminal(
         TarArchiveInputStream(decompressed).use { tar ->
             var e = tar.nextTarEntry
             while (e != null) {
-                // 兼容 PAX/GNU 长名头：commons-compress 会自动展开成普通 entry
                 val name = e.name.removePrefix("./")
                 if (name.isNotEmpty()) {
                     val out = File(dest, name)
-                    // 防路径穿越
                     val outParent = out.parentFile
                     if (outParent == null ||
                         !(outParent.canonicalPath + File.separator).startsWith(destPath)
@@ -145,26 +140,20 @@ class DebianTerminal(
                     when {
                         e.isDirectory -> {
                             out.mkdirs()
-                            // chmod 在个别文件系统上可能 EPERM/ENOTSUP，忽略失败
                             runCatching { Os.chmod(out.path, (e.mode and 0xFFF) or 0x1C0) }
                         }
                         e.isSymbolicLink -> {
                             out.parentFile?.mkdirs()
                             out.delete()
                             val ok = runCatching { Os.symlink(e.linkName, out.path) }.isSuccess
-                            if (!ok) {
-                                // 退化成一个普通文本文件，内容为链接目标，至少不阻塞解压
-                                runCatching { out.writeText(e.linkName) }
-                            }
+                            if (!ok) runCatching { out.writeText(e.linkName) }
                         }
                         e.isLink -> {
                             out.parentFile?.mkdirs()
                             out.delete()
                             val target = File(dest, e.linkName.removePrefix("./"))
                             val ok = runCatching { Os.link(target.path, out.path) }.isSuccess
-                            if (!ok) {
-                                runCatching { target.copyTo(out, overwrite = true) }
-                            }
+                            if (!ok) runCatching { target.copyTo(out, overwrite = true) }
                         }
                         e.isFile -> {
                             out.parentFile?.mkdirs()
@@ -184,7 +173,6 @@ class DebianTerminal(
 
     private fun libDir() = ctx.applicationInfo.nativeLibraryDir
 
-    /** proot 公共参数；full=true 时额外挂载 /sys 和共享目录。 */
     private fun prootBase(root: File, full: Boolean): MutableList<String>? {
         val proot = File(libDir(), "libproot.so")
         if (!proot.exists()) return null
@@ -206,7 +194,6 @@ class DebianTerminal(
         pb.environment().apply {
             put("PROOT_TMP_DIR", tmp.path)
             put("PROOT_NO_SECCOMP", "1")
-            // 仅动态链接版 proot 需要；静态版不要设，否则会泄漏进 Debian
             if (File(libDir, "libtalloc.so").exists()) put("LD_LIBRARY_PATH", libDir)
             if (loader.exists()) put("PROOT_LOADER", loader.path)
         }
@@ -232,15 +219,13 @@ class DebianTerminal(
         runCatching {
             val rc = File(root, "etc/resolv.conf")
             if (!rc.exists() || rc.length() == 0L || rc.readText().isBlank()) {
-                rc.delete() // 可能是指向 /run 的悬空符号链接
+                rc.delete()
                 rc.writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
             }
         }
-        // 确保 /tmp 存在，否则 script 的 `tty > /tmp/.mdtty` 会静默失败
         File(root, "tmp").mkdirs()
         File(root, TTY_FILE).delete()
 
-        // 用 script 在 rootfs 内分配 PTY，并记录 PTY 设备名，供后续调整窗口大小
         val hasScript = File(root, "usr/bin/script").exists()
         supportsResize = hasScript && File(root, "usr/bin/stty").exists()
         val shell =
@@ -291,7 +276,6 @@ class DebianTerminal(
         }
     }
 
-    /** 向 stdin 写入原始文本（含控制字符）。 */
     fun write(text: String) {
         val w = writer ?: return
         try {
@@ -305,7 +289,6 @@ class DebianTerminal(
         }
     }
 
-    /** 终端窗口大小变化（可在进程启动前调用，启动后自动应用）。 */
     fun resize(cols: Int, rows: Int) {
         if (cols <= 0 || rows <= 0) return
         wantedSize = cols to rows
@@ -326,7 +309,6 @@ class DebianTerminal(
         val root = rootDir ?: return
         if (!isRunning()) return
 
-        // 用 FileObserver + CountDownLatch 等 PTY 设备名出现；期间窗口又变了就放弃本次
         val tty = waitForTtyFile(root, RESIZE_TIMEOUT_MS) { isRunning() && wantedSize == size }
             ?: return
 
@@ -339,24 +321,15 @@ class DebianTerminal(
             val pb = ProcessBuilder(cmd).redirectErrorStream(true)
             applyEnv(pb)
             val p = pb.start()
-            // 排空输出，避免缓冲区满卡死
             p.inputStream.readBytes()
             if (p.waitFor() == 0) {
                 appliedSize = size
-                // 执行期间窗口又变了，再来一次
                 if (wantedSize != size) triggerResize()
             }
         } catch (_: Exception) {
         }
     }
 
-    /**
-     * 等 /tmp/.mdtty 写出合法的 /dev/... 路径。
-     * - 先做一次同步检查；
-     * - 之后注册 FileObserver，文件创建/写入完成时立刻唤醒；
-     * - 每 200ms 也会重新读文件，防止 FileObserver 漏事件；
-     * - stillValid 返回 false 时提前退出。
-     */
     private fun waitForTtyFile(root: File, timeoutMs: Long, stillValid: () -> Boolean): String? {
         val ttyFile = File(root, TTY_FILE)
         readTtyPath(ttyFile)?.let { return it }
@@ -376,16 +349,13 @@ class DebianTerminal(
         }
         observer.startWatching()
         try {
-            // 注册后再检查一次，避免在第一次检查和注册之间文件已经出现
             readTtyPath(ttyFile)?.let { return it }
-
             val deadline = System.currentTimeMillis() + timeoutMs
             while (System.currentTimeMillis() < deadline) {
                 if (!stillValid()) return null
                 val remaining = deadline - System.currentTimeMillis()
                 if (remaining <= 0) break
                 latch.await(minOf(remaining, 200L), TimeUnit.MILLISECONDS)
-                // 无论 latch 是否触发，都重新读文件，防止 FileObserver 漏事件
                 readTtyPath(ttyFile)?.let { return it }
             }
         } catch (_: InterruptedException) {
@@ -413,7 +383,6 @@ class DebianTerminal(
         runCatching { s?.close() }
         runCatching { p?.destroy() }
         runCatching { p?.destroyForcibly() }
-        // 关闭并释放 executor，下次 start() 时 ensureExecutors() 会重建
         synchronized(execLock) {
             runCatching { writer?.shutdownNow() }
             runCatching { resizer?.shutdownNow() }
