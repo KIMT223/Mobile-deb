@@ -50,8 +50,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // 从系统设置授权回来后自动开始
-        if (webReady && !everStarted) tryStart()
+        // 从系统设置授权回来后自动开始。
+        // 必须确实拿到权限才重试，否则用户拒绝后会反复弹设置页。
+        if (webReady && !started && hasStorageAccess()) tryStart()
     }
 
     // ------------------------------------------------------------ 权限
