@@ -13,7 +13,7 @@ import android.view.WindowManager
 
 class MainActivity : Activity() {
 
-    private data class Session(
+    private class Session(
         val id: Int,
         val name: String,
         val term: DebianTerminal,
@@ -36,12 +36,8 @@ class MainActivity : Activity() {
         ui.onInput = { id, data -> findSession(id)?.term?.write(data) }
         ui.onKey = { id, data -> findSession(id)?.term?.write(data) }
         ui.onResize = { id, c, r -> findSession(id)?.term?.resize(c, r) }
-        ui.onReady = { id, c, r ->
-            // 页面里 xterm 初始化完成，把当前尺寸同步给 proot
-            findSession(id)?.term?.resize(c, r)
-        }
+        ui.onReady = { id, c, r -> findSession(id)?.term?.resize(c, r) }
         ui.onPageReady = {
-            // WebView 加载完毕，启动第一个终端
             if (sessions.isEmpty()) ensureInitialSession()
         }
         ui.onNewSession = { createAndStartSession() }
@@ -51,7 +47,6 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // 从系统设置授权回来后自动开始；如果已授权则立刻进入
         if (!hasStorageAccess()) return
         if (sessions.isEmpty()) ensureInitialSession()
     }
@@ -93,7 +88,10 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ 终端
 
-    private fun findSession(id: Int): Session? = sessions.firstOrNull { it.id == id }
+    private fun findSession(id: Int): Session? {
+        for (s in sessions) if (s.id == id) return s
+        return null
+    }
 
     private fun ensureInitialSession() {
         if (sessions.isNotEmpty()) return
@@ -105,7 +103,6 @@ class MainActivity : Activity() {
         createAndStartSession()
     }
 
-    /** 新建一个终端：分配 id、注册 UI 标签、启动 proot。 */
     private fun createAndStartSession() {
         if (!hasStorageAccess()) {
             requestStorageAccess()
@@ -129,7 +126,7 @@ class MainActivity : Activity() {
             DebianTerminal.SHARED_DIR.mkdirs()
             if (!rootfsPrepared) {
                 if (!term.isRootfsReady()) {
-                    val ok = term.prepareRootfs { ui.printText(id, it) }
+                    val ok = term.prepareRootfs { msg -> ui.printText(id, msg) }
                     if (!ok) return@Thread
                 }
                 rootfsPrepared = true
@@ -140,19 +137,19 @@ class MainActivity : Activity() {
 
     private fun closeSession(id: Int) {
         val s = findSession(id) ?: return
+        val wasCurrent = ui.getCurrentId() == id
         s.term.stop()
         sessions.remove(s)
         ui.removeTab(id)
         if (sessions.isEmpty()) {
-            // 全部关掉了就自动新建一个，避免空界面
             createAndStartSession()
-        } else if (ui.getCurrentId() == id) {
-            ui.switchTab(sessions.last().id)
+        } else if (wasCurrent) {
+            ui.switchTab(sessions[sessions.size - 1].id)
         }
     }
 
     override fun onDestroy() {
-        sessions.forEach { it.term.stop() }
+        for (s in sessions) s.term.stop()
         sessions.clear()
         ui.destroy()
         super.onDestroy()
