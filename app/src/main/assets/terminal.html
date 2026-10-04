@@ -13,16 +13,16 @@
   }
   .term.active { display: block; }
 
-  /* ★ 文本选择层：默认透明、不接管触摸，选择模式才启用 */
+  /* ★ 文本层：常驻可选中，覆盖在 xterm 上 */
   .text-layer {
     position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
-    pointer-events: none;
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-touch-callout: none;
+    top: 4px; left: 4px;
+    pointer-events: auto;
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
     color: transparent;
-    opacity: 1;                  /* 保持 1，让选择高亮可见 */
+    -webkit-text-fill-color: transparent;  /* 看不见，但存在 */
     white-space: pre;
     overflow: hidden;
     z-index: 9999;
@@ -31,23 +31,21 @@
     line-height: 1.2;
     margin: 0;
     padding: 0;
-    /* 让浏览器知道这个层是可选的文本 */
-    -webkit-text-fill-color: transparent;
-  }
-  .text-layer.selecting {
-    pointer-events: auto;
-    user-select: text;
-    -webkit-user-select: text;
-    -webkit-touch-callout: default;
-    -webkit-text-fill-color: initial;  /* 选择时恢复，让手柄/放大镜正常 */
+    /* 让浏览器知道这里可以选 */
+    touch-action: pan-y;
   }
   .text-layer .tl-row {
     white-space: pre;
     margin: 0;
     padding: 0;
-    overflow: hidden;
     font-family: inherit;
     font-size: inherit;
+    overflow: hidden;
+  }
+  /* 用户选中后，让选区真正可见（默认选中的文本会自动反色显示） */
+  .text-layer ::selection {
+    background: rgba(58, 110, 165, 0.7);
+    color: transparent;
   }
 </style>
 </head>
@@ -56,10 +54,9 @@
 <script src="xterm/xterm.js"></script>
 <script src="xterm/addon-fit.js"></script>
 <script>
-  // -------------------------------------------------- 全局状态
+  // -------------------------------------------------- 全局
   const terms = new Map();
   let activeId = null;
-  let selectMode = false;
 
   function call(fn) {
     var b = window.Android;
@@ -89,7 +86,7 @@
     return null;
   }
 
-  // -------------------------------------------------- 终端生命周期
+  // -------------------------------------------------- 创建终端
 
   function createTerm(rawId) {
     const id = String(rawId);
@@ -118,6 +115,7 @@
       ta.setAttribute('spellcheck', 'false');
     }
 
+    // 用户通过软键盘输入
     term.onData(function (d) { call('input', id, d); });
 
     const entry = {
@@ -134,10 +132,10 @@
     terms.set(id, entry);
 
     // 渲染事件 → 同步文本层
-    if (typeof term.onRender === 'function')       term.onRender(function ()       { syncTextLayer(id); });
-    if (typeof term.onWriteParsed === 'function')  term.onWriteParsed(function ()  { syncTextLayer(id); });
-    if (typeof term.onScroll === 'function')       term.onScroll(function ()       { syncTextLayer(id); });
-    if (typeof term.onResize === 'function')       term.onResize(function ()       { syncTextLayer(id); });
+    if (typeof term.onRender === 'function')      term.onRender(function ()      { syncTextLayer(id); });
+    if (typeof term.onWriteParsed === 'function') term.onWriteParsed(function () { syncTextLayer(id); });
+    if (typeof term.onScroll === 'function')      term.onScroll(function ()      { syncTextLayer(id); });
+    if (typeof term.onResize === 'function')      term.onResize(function ()      { syncTextLayer(id); });
 
     if (activeId === null) {
       activeId = id;
@@ -180,18 +178,17 @@
     if (activeId === id) activeId = null;
   }
 
-  // 每帧重建 row div 结构
+  // -------------------------------------------------- 文本层构建
+
   function buildLayer(rawId) {
     const t = terms.get(String(rawId));
     if (!t) return;
     const term = t.term;
 
-    // 移除旧 layer
     if (t.layer && t.layer.parentElement) t.layer.parentElement.removeChild(t.layer);
 
     const layer = document.createElement('div');
     layer.className = 'text-layer';
-    // 挂到 .term 上（不是 .xterm-screen），绝对定位覆盖
     t.div.appendChild(layer);
     t.layer = layer;
     t.rowEls = [];
@@ -201,8 +198,6 @@
     const dims = getCellDims(term);
     const lineHeight = dims ? dims.h : Math.round(fs * 1.2);
 
-    // 和 xterm 内层 padding 对齐
-    // xterm 在 .xterm-screen 里有 0 padding，但外层 .term 有 4px
     layer.style.fontFamily = fam;
     layer.style.fontSize = fs + 'px';
     layer.style.lineHeight = lineHeight + 'px';
@@ -220,6 +215,40 @@
     t.rows = term.rows;
     t.fontSize = fs;
     t.lineHeight = lineHeight;
+
+    // 点击文本层 → 弹软键盘（不是长按）
+    layer.addEventListener('click', function () {
+      // 如果有选中内容，不清除焦点
+      try { term.focus(); } catch (e) {}
+    });
+
+    // 单指滑动 → 滚动终端（避免把滚动吃掉）
+    let lastY = 0;
+    let dragging = false;
+    layer.addEventListener('touchstart', function (e) {
+      if (e.touches.length !== 1) return;
+      // 有选择中就不滚动
+      try {
+        if (window.getSelection().toString().length > 0) return;
+      } catch (err) {}
+      lastY = e.touches[0].clientY;
+      dragging = true;
+    }, { passive: true });
+    layer.addEventListener('touchmove', function (e) {
+      if (!dragging || e.touches.length !== 1) return;
+      try {
+        if (window.getSelection().toString().length > 0) return;
+      } catch (err) {}
+      const y = e.touches[0].clientY;
+      const dy = lastY - y;
+      const lh = t.lineHeight || 16;
+      const lines = Math.trunc(dy / lh);
+      if (lines !== 0) {
+        try { term.scrollLines(lines); } catch (err) {}
+        lastY = y - (dy % lh);
+      }
+    }, { passive: true });
+    layer.addEventListener('touchend', function () { dragging = false; }, { passive: true });
   }
 
   // -------------------------------------------------- 文本层同步
@@ -229,8 +258,10 @@
     const t = terms.get(id);
     if (!t || !t.layer) return;
 
-    // 用户正在选择时暂停，避免打断
-    if (t.layer.classList.contains('selecting')) return;
+    // 用户正在选择时不打断
+    try {
+      if (window.getSelection().toString().length > 0) return;
+    } catch (e) {}
 
     const term = t.term;
 
@@ -268,38 +299,17 @@
     if (t) t.term.paste(text);
   }
 
-  function clearActive() {
-    if (activeId === null) return;
-    const t = terms.get(activeId);
-    if (t) t.term.clear();
-  }
-
-  function copyAllActive() {
+  // ★ 一个按钮搞定：有选中就复制选中，没选中就复制全屏
+  function copySelectionOrAll() {
+    let sel = '';
+    try { sel = window.getSelection().toString(); } catch (e) {}
+    if (sel) { call('onSelection', sel); return; }
     if (activeId === null) { call('onToast', '没有终端'); return; }
     const t = terms.get(activeId);
     if (!t) return;
     const all = t.layer ? (t.layer.innerText || t.layer.textContent || '') : '';
-    if (all) { call('onSelection', all); return; }
-    t.term.selectAll();
-    const s = t.term.getSelection();
-    t.term.clearSelection();
-    if (s) call('onSelection', s);
-    else call('onToast', '无内容可复制');
-  }
-
-  function copySelectionActive() {
-    // 优先：浏览器原生选择（选择模式下拖选的结果）
-    let nativeSel = '';
-    try { nativeSel = window.getSelection().toString(); } catch (e) {}
-    if (nativeSel) { call('onSelection', nativeSel); return; }
-
-    // 回退：xterm 内部选择
-    if (activeId === null) { call('onToast', '没有终端'); return; }
-    const t = terms.get(activeId);
-    if (!t) return;
-    const s = t.term.getSelection();
-    if (s) call('onSelection', s);
-    else call('onToast', '没有选中内容，长按并拖动手柄选择');
+    if (all) call('onSelection', all);
+    else call('onToast', '没有内容');
   }
 
   function arrowActive(c) {
@@ -324,33 +334,6 @@
     call('resize', activeId, t.term.cols, t.term.rows);
   }
 
-  // -------------------------------------------------- 选择模式
-
-  function enterSelectMode() {
-    if (activeId === null) return;
-    const t = terms.get(activeId);
-    if (!t) return;
-
-    syncTextLayer(activeId);
-
-    selectMode = true;
-    try { t.term.clearSelection(); } catch (e) {}
-    try { window.getSelection().removeAllRanges(); } catch (e) {}
-
-    if (!t.layer) buildLayer(activeId);
-    t.layer.classList.add('selecting');
-  }
-
-  function exitSelectMode() {
-    if (!selectMode) return;
-    selectMode = false;
-    try { window.getSelection().removeAllRanges(); } catch (e) {}
-    terms.forEach(function (t) {
-      if (t.layer) t.layer.classList.remove('selecting');
-    });
-    if (activeId !== null) syncTextLayer(activeId);
-  }
-
   // -------------------------------------------------- 窗口尺寸
 
   let timer = null;
@@ -365,13 +348,6 @@
       syncTextLayer(activeId);
       call('resize', activeId, t.term.cols, t.term.rows);
     }, 150);
-  });
-
-  document.addEventListener('click', function () {
-    if (selectMode) return;
-    if (activeId === null) return;
-    const t = terms.get(activeId);
-    if (t) t.term.focus();
   });
 
   call('pageReady');
