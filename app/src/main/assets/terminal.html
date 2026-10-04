@@ -61,9 +61,14 @@
     term.write(u);
   }
   function paste(t) { term.paste(t); }
+
+  // 兼容 xterm.js v4 (applicationCursorKeys) 与 v5 (applicationCursorKeysMode)
   function arrow(c) {
-    call('key', (term.modes.applicationCursorKeysMode ? '\x1bO' : '\x1b[') + c);
+    var app = term.modes.applicationCursorKeysMode;
+    if (app === undefined) app = term.modes.applicationCursorKeys;
+    call('key', (app ? '\x1bO' : '\x1b[') + c);
   }
+
   function fontDelta(d) {
     const s = Math.max(8, Math.min(28, term.options.fontSize + d));
     term.options.fontSize = s;
