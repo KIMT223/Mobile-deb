@@ -23,6 +23,10 @@
   const terms = new Map();
   let activeId = null;
 
+  // 选择模式
+  let selectMode = false;
+  let dragStart = null;
+
   // 桥接兜底：桥未注入时不报错
   function call(fn) {
     var b = window.Android;
@@ -57,23 +61,19 @@
       ta.setAttribute('spellcheck', 'false');
     }
 
-    // 输入 -> Kotlin（带上 id）
     term.onData(function (d) { call('input', id, d); });
 
     terms.set(id, { term: term, fit: fit, div: div });
 
-    // 第一个终端自动激活
     if (activeId === null) {
       activeId = id;
       div.classList.add('active');
       try { fit.fit(); } catch (e) {}
       term.focus();
     } else {
-      // 后台终端也先 fit 一次，保证 cols/rows 有意义
       try { fit.fit(); } catch (e) {}
     }
 
-    // 告诉 Android 尺寸就绪
     call('ready', id, term.cols, term.rows);
   }
 
@@ -140,7 +140,7 @@
     if (!t) return;
     const s = t.term.getSelection();
     if (s) call('onSelection', s);
-    else call('onToast', '没有选中内容，长按选择「全选并复制」');
+    else call('onToast', '没有选中内容，先拖动选择');
   }
 
   function arrowActive(c) {
@@ -162,7 +162,106 @@
     call('resize', activeId, t.term.cols, t.term.rows);
   }
 
-  // 窗口尺寸变化：只 fit 当前终端
+  // ------------------------ 选择模式 ------------------------
+
+  function enterSelectMode() {
+    if (activeId === null) return;
+    selectMode = true;
+    dragStart = null;
+    const t = terms.get(activeId);
+    if (t) {
+      try { t.term.clearSelection(); } catch (e) {}
+      t.term.focus();
+    }
+  }
+
+  function exitSelectMode() {
+    selectMode = false;
+    dragStart = null;
+    if (activeId !== null) {
+      const t = terms.get(activeId);
+      if (t) {
+        try { t.term.clearSelection(); } catch (e) {}
+      }
+    }
+  }
+
+  // 把屏幕坐标换算成 (col, bufferRow)
+  function posFromPoint(x, y) {
+    if (activeId === null) return null;
+    const t = terms.get(activeId);
+    if (!t) return null;
+    // xterm-screen 是精确的文本网格区域
+    const screen = t.term.element.querySelector('.xterm-screen');
+    if (!screen) return null;
+    const rect = screen.getBoundingClientRect();
+    const cols = t.term.cols;
+    const rows = t.term.rows;
+    if (cols <= 0 || rows <= 0) return null;
+    const cellW = rect.width / cols;
+    const cellH = rect.height / rows;
+    if (cellW <= 0 || cellH <= 0) return null;
+    let col = Math.floor((x - rect.left) / cellW);
+    let row = Math.floor((y - rect.top) / cellH);
+    if (col < 0) col = 0;
+    if (col > cols - 1) col = cols - 1;
+    if (row < 0) row = 0;
+    if (row > rows - 1) row = rows - 1;
+    // 换算到 buffer 绝对行，滚动过也不偏
+    const bufferRow = row + t.term.buffer.active.viewportY;
+    return { col: col, row: bufferRow };
+  }
+
+  function applySelection(term, a, b) {
+    const cols = term.cols;
+    let c1 = a.col, r1 = a.row;
+    let c2 = b.col, r2 = b.row;
+    if (r1 > r2 || (r1 === r2 && c1 > c2)) {
+      const tc = c1, tr = r1;
+      c1 = c2; r1 = r2;
+      c2 = tc; r2 = tr;
+    }
+    const length = (r2 - r1) * cols + (c2 - c1) + 1;
+    if (length > 0) {
+      try { term.select(c1, r1, length); } catch (e) {}
+    }
+  }
+
+  // 选择模式下，用捕获阶段接管触摸事件，做真实的拖选
+  const termsContainer = document.getElementById('terms');
+
+  termsContainer.addEventListener('touchstart', function (e) {
+    if (!selectMode) return;
+    if (e.touches.length !== 1) return;
+    const touch = e.touches[0];
+    const pos = posFromPoint(touch.clientX, touch.clientY);
+    if (!pos) return;
+    dragStart = pos;
+    e.preventDefault();
+    e.stopPropagation();
+  }, { capture: true, passive: false });
+
+  termsContainer.addEventListener('touchmove', function (e) {
+    if (!selectMode || !dragStart) return;
+    if (e.touches.length !== 1) return;
+    if (activeId === null) return;
+    const t = terms.get(activeId);
+    if (!t) return;
+    const touch = e.touches[0];
+    const pos = posFromPoint(touch.clientX, touch.clientY);
+    if (!pos) return;
+    applySelection(t.term, dragStart, pos);
+    e.preventDefault();
+    e.stopPropagation();
+  }, { capture: true, passive: false });
+
+  termsContainer.addEventListener('touchend', function (e) {
+    if (!selectMode) return;
+    dragStart = null;
+  }, { capture: true });
+
+  // ------------------------ 窗口尺寸 ------------------------
+
   let timer = null;
   window.addEventListener('resize', function () {
     clearTimeout(timer);
@@ -176,12 +275,12 @@
   });
 
   document.addEventListener('click', function () {
+    if (selectMode) return;
     if (activeId === null) return;
     const t = terms.get(activeId);
     if (t) t.term.focus();
   });
 
-  // 页面就绪，通知 Android 可以创建终端了
   call('pageReady');
 </script>
 </body>
