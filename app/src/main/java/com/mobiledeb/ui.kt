@@ -29,10 +29,6 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * WebView + xterm.js 多终端界面。
- *
- * - 一个 WebView 里多个 xterm.js 实例，通过 JS 桥按 id 路由输入输出；
- * - 侧边栏列出所有终端，点击切换，点「×」关闭，点「+」新建；
- * - 长按 WebView 弹出菜单：全选并复制 / 复制选中 / 粘贴 / 清屏 / 字号。
  */
 class TerminalUi(private val activity: Activity) {
 
@@ -61,9 +57,10 @@ class TerminalUi(private val activity: Activity) {
         val baos = ByteArrayOutputStream()
         var scheduled = false
     }
+
     private val buffers = ConcurrentHashMap<Int, Buf>()
 
-    @Volatile private var pageReady = false
+    @Volatile private var webReady = false
     @Volatile private var destroyed = false
     @Volatile private var ctrl = false
     private var ctrlButton: Button? = null
@@ -76,29 +73,29 @@ class TerminalUi(private val activity: Activity) {
         const val SIDEBAR_WIDTH_DP = 220
     }
 
-    private fun dp(v: Int) = TypedValue.applyDimension(
+    private fun dp(v: Int): Int = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), activity.resources.displayMetrics
     ).toInt()
 
     // ---------------------------------------------------------- WebView
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView() = WebView(activity).apply {
-        setBackgroundColor(0xFF121212.toInt())
-        overScrollMode = View.OVER_SCROLL_NEVER
-        settings.javaScriptEnabled = true
-        settings.allowContentAccess = false
-        webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) = true
+    private fun createWebView(): WebView {
+        val wv = WebView(activity)
+        wv.setBackgroundColor(0xFF121212.toInt())
+        wv.overScrollMode = View.OVER_SCROLL_NEVER
+        wv.settings.javaScriptEnabled = true
+        wv.settings.allowContentAccess = false
+        wv.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
         }
-        addJavascriptInterface(Bridge(), "Android")
-        loadUrl("file:///android_asset/terminal.html")
-
-        // 长按 -> 弹出终端菜单
-        setOnLongClickListener {
+        wv.addJavascriptInterface(Bridge(), "Android")
+        wv.loadUrl("file:///android_asset/terminal.html")
+        wv.setOnLongClickListener {
             showTerminalMenu()
             true
         }
+        return wv
     }
 
     // ---------------------------------------------------------- 初始化布局
@@ -118,11 +115,13 @@ class TerminalUi(private val activity: Activity) {
         bar.addView(button("☰") { toggleSidebar() })
         ctrlButton = button("Ctrl") { setCtrl(!ctrl) }.also { bar.addView(it) }
 
-        fun raw(label: String, seq: String) =
+        fun raw(label: String, seq: String) {
             bar.addView(button(label) { onKey(currentId, seq) })
+        }
 
-        fun jsCall(label: String, code: String) =
+        fun jsCall(label: String, code: String) {
             bar.addView(button(label) { if (!destroyed) web.evaluateJavascript(code, null) })
+        }
 
         raw("Esc", "\u001B")
         raw("Tab", "\t")
@@ -156,7 +155,6 @@ class TerminalUi(private val activity: Activity) {
         )
         root.addView(main, FrameLayout.LayoutParams(-1, -1))
 
-        // 侧边栏遮罩
         scrim = View(activity).apply {
             setBackgroundColor(0x88000000.toInt())
             visibility = View.GONE
@@ -164,7 +162,6 @@ class TerminalUi(private val activity: Activity) {
         }
         root.addView(scrim, FrameLayout.LayoutParams(-1, -1))
 
-        // 侧边栏
         sidebar = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#1B1B1B"))
@@ -197,7 +194,7 @@ class TerminalUi(private val activity: Activity) {
         root.addView(sidebar, sidebarLp)
     }
 
-    private fun button(label: String, action: () -> Unit) = Button(activity).apply {
+    private fun button(label: String, action: () -> Unit): Button = Button(activity).apply {
         text = label
         isAllCaps = false
         minWidth = dp(46)
@@ -252,7 +249,7 @@ class TerminalUi(private val activity: Activity) {
     }
 
     private fun refreshActiveHighlight() {
-        sessionItems.forEach { (id, v) ->
+        for ((id, v) in sessionItems) {
             v.setBackgroundColor(
                 if (id == currentId) Color.parseColor("#2A4A6E") else Color.TRANSPARENT
             )
@@ -261,12 +258,11 @@ class TerminalUi(private val activity: Activity) {
 
     // ---------------------------------------------------------- 会话 API
 
-    /** 新建一个终端标签；activate=true 时立即切换过去。 */
     fun createTab(id: Int, name: String, activate: Boolean) {
         sessionItems[id] = makeSessionItem(id, name).also { sessionList.addView(it) }
         if (activate) currentId = id
         refreshActiveHighlight()
-        if (!pageReady) return
+        if (!webReady) return
         web.evaluateJavascript("createTerm($id)", null)
         if (activate) web.evaluateJavascript("switchTerm($id)", null)
     }
@@ -274,36 +270,39 @@ class TerminalUi(private val activity: Activity) {
     fun switchTab(id: Int) {
         currentId = id
         refreshActiveHighlight()
-        if (pageReady) web.evaluateJavascript("switchTerm($id)", null)
+        if (webReady) web.evaluateJavascript("switchTerm($id)", null)
         hideSidebar()
     }
 
     fun removeTab(id: Int) {
-        sessionItems.remove(id)?.let { sessionList.removeView(it) }
+        val v = sessionItems.remove(id)
+        if (v != null) sessionList.removeView(v)
         buffers.remove(id)
-        if (pageReady) web.evaluateJavascript("closeTerm($id)", null)
+        if (webReady) web.evaluateJavascript("closeTerm($id)", null)
         if (currentId == id) currentId = -1
         refreshActiveHighlight()
     }
 
-    fun getCurrentId() = currentId
-    fun isPageReady() = pageReady
+    fun getCurrentId(): Int = currentId
+    fun isPageReady(): Boolean = webReady
 
     // ---------------------------------------------------------- 输出
 
     fun writeBytes(id: Int, b: ByteArray) {
-        val buf = buffers.getOrPut(id) { Buf() }
+        var buf = buffers[id]
+        if (buf == null) {
+            buf = Buf()
+            buffers[id] = buf
+        }
         synchronized(buf) { buf.baos.write(b, 0, b.size) }
         scheduleFlush(id, buf)
     }
 
-    /** 提示文本：把裸 \n 规范成 \r\n，保留原有的 \r，避免破坏进度条。 */
     fun printText(id: Int, s: String) {
         val n = s.replace("\r\n", "\n").replace("\n", "\r\n")
         writeBytes(id, n.toByteArray(Charsets.UTF_8))
     }
 
-    /** 在还没有任何终端时（比如首次请求权限）把提示写到当前 UI 上。 */
     fun printGlobalText(s: String) {
         val n = s.replace("\r\n", "\n").replace("\n", "\r\n")
         if (currentId >= 0) writeBytes(currentId, n.toByteArray(Charsets.UTF_8))
@@ -323,7 +322,7 @@ class TerminalUi(private val activity: Activity) {
         val buf = buffers[id] ?: return
         val data: ByteArray? = synchronized(buf) {
             buf.scheduled = false
-            if (!pageReady) null else buf.baos.toByteArray().also { buf.baos.reset() }
+            if (!webReady) null else buf.baos.toByteArray().also { buf.baos.reset() }
         }
         if (data == null || data.isEmpty()) return
         var off = 0
@@ -342,7 +341,6 @@ class TerminalUi(private val activity: Activity) {
         ctrlButton?.setBackgroundColor(if (on) Color.parseColor("#3A6EA5") else Color.TRANSPARENT)
     }
 
-    /** Ctrl 打开时把下一个字符转成控制字符，随后自动关闭。 */
     private fun applyCtrl(d: String): String {
         if (!ctrl || d.length != 1) return d
         val c = d[0]
@@ -385,7 +383,7 @@ class TerminalUi(private val activity: Activity) {
                     2 -> paste()
                     3 -> web.evaluateJavascript("clearActive()", null)
                     4 -> web.evaluateJavascript("fontDeltaActive(-1)", null)
-                    5 -> web.evaluateJavascript("fontDeltaActive(1)", null)
+                    else -> web.evaluateJavascript("fontDeltaActive(1)", null)
                 }
             }
             .show()
@@ -434,7 +432,7 @@ class TerminalUi(private val activity: Activity) {
         fun pageReady() {
             activity.runOnUiThread {
                 if (destroyed) return@runOnUiThread
-                pageReady = true
+                webReady = true
                 onPageReady()
             }
         }
