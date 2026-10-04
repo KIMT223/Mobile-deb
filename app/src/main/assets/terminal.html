@@ -12,6 +12,38 @@
     padding: 4px; box-sizing: border-box; display: none;
   }
   .term.active { display: block; }
+
+  /* ★ 文本选择层：覆盖在 xterm 之上，正常模式不接管触摸 */
+  .text-layer {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    opacity: 0.01;               /* 不是 0，某些 WebView 对 opacity:0 不响应长按 */
+    color: transparent;
+    white-space: pre;
+    overflow: hidden;
+    z-index: 10;
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1.2;
+    margin: 0;
+    padding: 0;
+  }
+  .text-layer.selecting {
+    pointer-events: auto;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .text-layer .tl-row {
+    white-space: pre;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    font-family: inherit;
+    font-size: inherit;
+  }
 </style>
 </head>
 <body>
@@ -19,20 +51,42 @@
 <script src="xterm/xterm.js"></script>
 <script src="xterm/addon-fit.js"></script>
 <script>
-  // id -> { term, fit, div }
+  // -------------------------------------------------- 全局状态
   const terms = new Map();
   let activeId = null;
-
-  // 选择模式
   let selectMode = false;
-  let dragStart = null;
 
-  // 桥接兜底：桥未注入时不报错
   function call(fn) {
     var b = window.Android;
     if (!b || typeof b[fn] !== 'function') return;
     try { b[fn].apply(b, Array.prototype.slice.call(arguments, 1)); } catch (e) {}
   }
+
+  // 兼容 v4/v5 的 option 读取
+  function getOpt(term, key, def) {
+    try {
+      if (term.options && typeof term.options[key] !== 'undefined') return term.options[key];
+      if (typeof term.getOption === 'function') {
+        var v = term.getOption(key);
+        if (typeof v !== 'undefined') return v;
+      }
+    } catch (e) {}
+    return def;
+  }
+
+  // 从 xterm 内部读单元格尺寸（宽/高）
+  function getCellDims(term) {
+    try {
+      var core = term._core || term.core;
+      var dims = core && core._renderService && core._renderService.dimensions;
+      if (dims && dims.css && dims.css.cell) {
+        return { w: dims.css.cell.width, h: dims.css.cell.height };
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // -------------------------------------------------- 终端生命周期
 
   function createTerm(rawId) {
     const id = String(rawId);
@@ -61,9 +115,32 @@
       ta.setAttribute('spellcheck', 'false');
     }
 
+    // 用户输入 -> Kotlin
     term.onData(function (d) { call('input', id, d); });
 
-    terms.set(id, { term: term, fit: fit, div: div });
+    // ★ 建文本层
+    const layer = document.createElement('div');
+    layer.className = 'text-layer';
+    div.appendChild(layer);
+
+    const entry = {
+      term: term,
+      fit: fit,
+      div: div,
+      layer: layer,
+      rowEls: [],
+      cols: 0,
+      rows: 0,
+      fontSize: 0,
+      lineHeight: 0,
+    };
+    terms.set(id, entry);
+
+    // 各种渲染/滚动事件都触发同步
+    if (typeof term.onRender === 'function')     term.onRender(function ()     { syncTextLayer(id); });
+    if (typeof term.onWriteParsed === 'function') term.onWriteParsed(function () { syncTextLayer(id); });
+    if (typeof term.onScroll === 'function')     term.onScroll(function ()     { syncTextLayer(id); });
+    if (typeof term.onResize === 'function')     term.onResize(function ()     { syncTextLayer(id); });
 
     if (activeId === null) {
       activeId = id;
@@ -73,6 +150,10 @@
     } else {
       try { fit.fit(); } catch (e) {}
     }
+
+    // 把文本层塞进 .xterm-screen，共用同一坐标系
+    mountLayerInto(entry);
+    syncTextLayer(id);
 
     call('ready', id, term.cols, term.rows);
   }
@@ -88,6 +169,8 @@
     });
     try { t.fit.fit(); } catch (e) {}
     t.term.focus();
+    mountLayerInto(t);
+    syncTextLayer(id);
     call('resize', id, t.term.cols, t.term.rows);
   }
 
@@ -101,7 +184,85 @@
     if (activeId === id) activeId = null;
   }
 
-  // 输出：Kotlin -> base64 字节 -> xterm
+  // 把 layer 挂到 .xterm-screen 里，自动撑满
+  function mountLayerInto(t) {
+    try {
+      const screen = t.div.querySelector('.xterm-screen');
+      if (!screen) return;
+      if (t.layer.parentElement !== screen) {
+        screen.appendChild(t.layer);
+      }
+      t.layer.style.position = 'absolute';
+      t.layer.style.left = '0';
+      t.layer.style.top = '0';
+      t.layer.style.right = '0';
+      t.layer.style.bottom = '0';
+    } catch (e) {}
+  }
+
+  // -------------------------------------------------- 文本层同步
+
+  function syncTextLayer(rawId) {
+    const id = String(rawId);
+    const t = terms.get(id);
+    if (!t) return;
+    // 用户正在选择：不打断
+    if (t.layer.classList.contains('selecting')) return;
+    const term = t.term;
+
+    const fs = getOpt(term, 'fontSize', 13);
+    const fam = getOpt(term, 'fontFamily', 'monospace');
+    const dims = getCellDims(term);
+    const lineHeight = dims ? dims.h : Math.round(fs * 1.2);
+
+    // 行列变化：重建行 div
+    if (t.cols !== term.cols || t.rows !== term.rows) {
+      rebuildRowEls(t, term.rows, lineHeight);
+      t.cols = term.cols;
+      t.rows = term.rows;
+    }
+
+    // 字体或行高变化：更新样式
+    if (t.fontSize !== fs || t.lineHeight !== lineHeight) {
+      t.layer.style.fontFamily = fam;
+      t.layer.style.fontSize = fs + 'px';
+      t.layer.style.lineHeight = lineHeight + 'px';
+      for (let i = 0; i < t.rowEls.length; i++) {
+        t.rowEls[i].style.lineHeight = lineHeight + 'px';
+        t.rowEls[i].style.height = lineHeight + 'px';
+      }
+      t.fontSize = fs;
+      t.lineHeight = lineHeight;
+    }
+
+    // 填内容
+    const buf = term.buffer.active;
+    const viewportY = buf.viewportY;
+    for (let r = 0; r < term.rows; r++) {
+      const line = buf.getLine(viewportY + r);
+      const text = line ? line.translateToString(true) : '';
+      const el = t.rowEls[r];
+      if (el && el.textContent !== text) {
+        el.textContent = text;
+      }
+    }
+  }
+
+  function rebuildRowEls(t, rows, lineHeight) {
+    t.layer.innerHTML = '';
+    t.rowEls = [];
+    for (let r = 0; r < rows; r++) {
+      const row = document.createElement('div');
+      row.className = 'tl-row';
+      row.style.lineHeight = lineHeight + 'px';
+      row.style.height = lineHeight + 'px';
+      t.layer.appendChild(row);
+      t.rowEls.push(row);
+    }
+  }
+
+  // -------------------------------------------------- 输出
+
   function w(rawId, b64) {
     const t = terms.get(String(rawId));
     if (!t) return;
@@ -109,6 +270,8 @@
     const u = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
     t.term.write(u);
+    // 下一帧再同步一次，xterm 渲染完成后
+    setTimeout(function () { syncTextLayer(rawId); }, 0);
   }
 
   function pasteActive(text) {
@@ -127,6 +290,13 @@
     if (activeId === null) { call('onToast', '没有终端'); return; }
     const t = terms.get(activeId);
     if (!t) return;
+    // 先取文本层全部文本（含换行）
+    const all = t.layer.innerText || t.layer.textContent || '';
+    if (all) {
+      call('onSelection', all);
+      return;
+    }
+    // 回退到 xterm
     t.term.selectAll();
     const s = t.term.getSelection();
     t.term.clearSelection();
@@ -135,6 +305,14 @@
   }
 
   function copySelectionActive() {
+    // 1) 浏览器原生选择（选择模式下的拖选）
+    let nativeSel = '';
+    try { nativeSel = window.getSelection().toString(); } catch (e) {}
+    if (nativeSel) {
+      call('onSelection', nativeSel);
+      return;
+    }
+    // 2) xterm 自己那套选择
     if (activeId === null) { call('onToast', '没有终端'); return; }
     const t = terms.get(activeId);
     if (!t) return;
@@ -156,111 +334,50 @@
     if (activeId === null) return;
     const t = terms.get(activeId);
     if (!t) return;
-    const s = Math.max(8, Math.min(28, t.term.options.fontSize + d));
-    t.term.options.fontSize = s;
+    const cur = getOpt(t.term, 'fontSize', 13);
+    const s = Math.max(8, Math.min(28, cur + d));
+    try { t.term.options.fontSize = s; } catch (e) {}
     try { t.fit.fit(); } catch (e) {}
+    // 强制下次 sync 时更新样式
+    t.fontSize = 0;
+    mountLayerInto(t);
+    syncTextLayer(activeId);
     call('resize', activeId, t.term.cols, t.term.rows);
   }
 
-  // ------------------------ 选择模式 ------------------------
+  // -------------------------------------------------- 选择模式
 
   function enterSelectMode() {
     if (activeId === null) return;
-    selectMode = true;
-    dragStart = null;
     const t = terms.get(activeId);
-    if (t) {
-      try { t.term.clearSelection(); } catch (e) {}
-      t.term.focus();
-    }
+    if (!t) return;
+
+    // 刷新一次，保证文本层是最新的
+    syncTextLayer(activeId);
+
+    selectMode = true;
+
+    // 清掉 xterm 自己的选择
+    try { t.term.clearSelection(); } catch (e) {}
+    try { window.getSelection().removeAllRanges(); } catch (e) {}
+
+    // ★ 开启文本层的原生选择
+    mountLayerInto(t);
+    t.layer.classList.add('selecting');
   }
 
   function exitSelectMode() {
+    if (!selectMode) return;
     selectMode = false;
-    dragStart = null;
-    if (activeId !== null) {
-      const t = terms.get(activeId);
-      if (t) {
-        try { t.term.clearSelection(); } catch (e) {}
-      }
-    }
+    try { window.getSelection().removeAllRanges(); } catch (e) {}
+    terms.forEach(function (t) {
+      t.layer.classList.remove('selecting');
+    });
+    // 退出后同步一次
+    if (activeId !== null) syncTextLayer(activeId);
   }
 
-  // 把屏幕坐标换算成 (col, bufferRow)
-  function posFromPoint(x, y) {
-    if (activeId === null) return null;
-    const t = terms.get(activeId);
-    if (!t) return null;
-    // xterm-screen 是精确的文本网格区域
-    const screen = t.term.element.querySelector('.xterm-screen');
-    if (!screen) return null;
-    const rect = screen.getBoundingClientRect();
-    const cols = t.term.cols;
-    const rows = t.term.rows;
-    if (cols <= 0 || rows <= 0) return null;
-    const cellW = rect.width / cols;
-    const cellH = rect.height / rows;
-    if (cellW <= 0 || cellH <= 0) return null;
-    let col = Math.floor((x - rect.left) / cellW);
-    let row = Math.floor((y - rect.top) / cellH);
-    if (col < 0) col = 0;
-    if (col > cols - 1) col = cols - 1;
-    if (row < 0) row = 0;
-    if (row > rows - 1) row = rows - 1;
-    // 换算到 buffer 绝对行，滚动过也不偏
-    const bufferRow = row + t.term.buffer.active.viewportY;
-    return { col: col, row: bufferRow };
-  }
-
-  function applySelection(term, a, b) {
-    const cols = term.cols;
-    let c1 = a.col, r1 = a.row;
-    let c2 = b.col, r2 = b.row;
-    if (r1 > r2 || (r1 === r2 && c1 > c2)) {
-      const tc = c1, tr = r1;
-      c1 = c2; r1 = r2;
-      c2 = tc; r2 = tr;
-    }
-    const length = (r2 - r1) * cols + (c2 - c1) + 1;
-    if (length > 0) {
-      try { term.select(c1, r1, length); } catch (e) {}
-    }
-  }
-
-  // 选择模式下，用捕获阶段接管触摸事件，做真实的拖选
-  const termsContainer = document.getElementById('terms');
-
-  termsContainer.addEventListener('touchstart', function (e) {
-    if (!selectMode) return;
-    if (e.touches.length !== 1) return;
-    const touch = e.touches[0];
-    const pos = posFromPoint(touch.clientX, touch.clientY);
-    if (!pos) return;
-    dragStart = pos;
-    e.preventDefault();
-    e.stopPropagation();
-  }, { capture: true, passive: false });
-
-  termsContainer.addEventListener('touchmove', function (e) {
-    if (!selectMode || !dragStart) return;
-    if (e.touches.length !== 1) return;
-    if (activeId === null) return;
-    const t = terms.get(activeId);
-    if (!t) return;
-    const touch = e.touches[0];
-    const pos = posFromPoint(touch.clientX, touch.clientY);
-    if (!pos) return;
-    applySelection(t.term, dragStart, pos);
-    e.preventDefault();
-    e.stopPropagation();
-  }, { capture: true, passive: false });
-
-  termsContainer.addEventListener('touchend', function (e) {
-    if (!selectMode) return;
-    dragStart = null;
-  }, { capture: true });
-
-  // ------------------------ 窗口尺寸 ------------------------
+  // -------------------------------------------------- 窗口尺寸
 
   let timer = null;
   window.addEventListener('resize', function () {
@@ -270,6 +387,8 @@
       const t = terms.get(activeId);
       if (!t) return;
       try { t.fit.fit(); } catch (e) {}
+      mountLayerInto(t);
+      syncTextLayer(activeId);
       call('resize', activeId, t.term.cols, t.term.rows);
     }, 150);
   });
