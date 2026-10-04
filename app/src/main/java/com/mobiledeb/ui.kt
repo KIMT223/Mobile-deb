@@ -155,9 +155,13 @@ class TerminalUi(private val activity: Activity) {
         scheduleFlush()
     }
 
-    /** 线程安全。显示普通文字（提示、错误信息）。 */
+    /**
+     * 线程安全。显示普通文字（提示、错误信息）。
+     * 只把裸 \n 规范成 \r\n；保留原本的 \r，避免破坏进度条这类带 \r 的输出。
+     */
     fun printText(s: String) {
-        writeBytes(s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n").toByteArray(Charsets.UTF_8))
+        val normalized = s.replace("\r\n", "\n").replace("\n", "\r\n")
+        writeBytes(normalized.toByteArray(Charsets.UTF_8))
     }
 
     private fun scheduleFlush() {
