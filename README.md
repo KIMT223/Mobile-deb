@@ -6,7 +6,7 @@
    /storage/emulated/0/mobile_deb/
 4. 安装运行，授予「所有文件访问」权限，首次启动自动解压到应用内部存储。
 
-Debian 内 /mnt/shared 即共享目录 /storage/emulated/0/mobile_deb/。
+Debian 内 /mnt/shared 即共享目录 /storage/emulated/0/mobile_deb/
 
 ## 终端界面 (WebView + xterm.js)
 
