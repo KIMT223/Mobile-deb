@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="xterm/xterm.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #121212; overflow: hidden; }
+  #t { position: absolute; top: 0; left: 0; right: 0; bottom: 0; padding: 4px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="t"></div>
+<script src="xterm/xterm.js"></script>
+<script src="xterm/addon-fit.js"></script>
+<script>
+  const term = new Terminal({
+    fontSize: 13,
+    fontFamily: 'monospace',
+    cursorBlink: true,
+    scrollback: 5000,
+    theme: { background: '#121212', foreground: '#d4d4d4' }
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('t'));
+
+  const ta = term.textarea;
+  if (ta) {
+    ta.setAttribute('autocorrect', 'off');
+    ta.setAttribute('autocapitalize', 'off');
+    ta.setAttribute('autocomplete', 'off');
+    ta.setAttribute('spellcheck', 'false');
+  }
+
+  // 桥接兜底：在普通浏览器里调试或桥未注入时不报错
+  function call(fn) {
+    var b = window.Android;
+    if (!b || typeof b[fn] !== 'function') return;
+    try { b[fn].apply(b, Array.prototype.slice.call(arguments, 1)); } catch (e) {}
+  }
+  function doFit() {
+    try { fit.fit(); } catch (e) {}
+    call('resize', term.cols, term.rows);
+  }
+  let timer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(timer);
+    timer = setTimeout(doFit, 150);
+  });
+  document.addEventListener('click', function () { term.focus(); });
+
+  // 用户输入 -> Kotlin
+  term.onData(function (d) { call('input', d); });
+
+  // Kotlin 输出 (base64 字节) -> 终端
+  function w(b64) {
+    const s = atob(b64);
+    const u = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+    term.write(u);
+  }
+  function paste(t) { term.paste(t); }
+  function arrow(c) {
+    call('key', (term.modes.applicationCursorKeysMode ? '\x1bO' : '\x1b[') + c);
+  }
+  function fontDelta(d) {
+    const s = Math.max(8, Math.min(28, term.options.fontSize + d));
+    term.options.fontSize = s;
+    doFit();
+  }
+
+  try { fit.fit(); } catch (e) {}
+  term.focus();
+  call('ready', term.cols, term.rows);
+</script>
+</body>
+</html>
