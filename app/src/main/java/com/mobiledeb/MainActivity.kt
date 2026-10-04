@@ -15,7 +15,7 @@ class MainActivity : Activity() {
 
     private class Session(
         val id: Int,
-        val name: String,
+        var name: String,
         val term: DebianTerminal,
     )
 
@@ -23,7 +23,6 @@ class MainActivity : Activity() {
     private val sessions = mutableListOf<Session>()
     private var nextId = 1
 
-    /** 全局只解压一次 rootfs，多终端共享 filesDir/rootfs。 */
     @Volatile private var rootfsPrepared = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -37,12 +36,13 @@ class MainActivity : Activity() {
         ui.onKey = { id, data -> findSession(id)?.term?.write(data) }
         ui.onResize = { id, c, r -> findSession(id)?.term?.resize(c, r) }
         ui.onReady = { id, c, r -> findSession(id)?.term?.resize(c, r) }
-        ui.onPageReady = {
-            if (sessions.isEmpty()) ensureInitialSession()
-        }
+        ui.onPageReady = { if (sessions.isEmpty()) ensureInitialSession() }
         ui.onNewSession = { createAndStartSession() }
         ui.onSwitchSession = { id -> ui.switchTab(id) }
         ui.onCloseSession = { id -> closeSession(id) }
+        ui.onRenameSession = { id, newName ->
+            findSession(id)?.name = newName
+        }
     }
 
     override fun onResume() {
@@ -109,8 +109,6 @@ class MainActivity : Activity() {
             return
         }
         val id = nextId++
-
-        // 注意：这个变量不能叫 name，否则会遮蔽 Thread.name
         val sessionName = "终端 $id"
 
         val term = DebianTerminal(
@@ -118,7 +116,8 @@ class MainActivity : Activity() {
             onOutput = { ui.writeBytes(id, it) },
             onMessage = { ui.printText(id, it) },
             onExit = { code ->
-                ui.printText(id, "\n[进程已退出，code=$code]\n点侧边栏「+」新建，或「×」关闭。\n")
+                ui.setSessionStatus(id, false)
+                ui.printText(id, "\n[进程已退出，code=$code]\n")
             },
         )
         val s = Session(id, sessionName, term)
@@ -130,13 +129,16 @@ class MainActivity : Activity() {
             if (!rootfsPrepared) {
                 if (!term.isRootfsReady()) {
                     val ok = term.prepareRootfs { msg -> ui.printText(id, msg) }
-                    if (!ok) return@Thread
+                    if (!ok) {
+                        ui.setSessionStatus(id, false)
+                        return@Thread
+                    }
                 }
                 rootfsPrepared = true
             }
             term.start()
+            ui.setSessionStatus(id, true)
         }
-        // 用 also + it.name 显式指定接收者，避免任何作用域解析歧义
         bootThread.also { it.name = "debian-boot-$id" }.start()
     }
 
