@@ -14,6 +14,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -41,6 +43,8 @@ class DebianTerminal(
         private const val PATH_ENV =
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         private const val RESIZE_TIMEOUT_MS = 8000L
+        private const val ROOTFS_URL =
+            "https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-arm64v8/trixie/oci/blobs/rootfs.tar.gz"
     }
 
     private val ttyRel = "tmp/.mdtty-$id"
@@ -95,11 +99,17 @@ class DebianTerminal(
 
     /** 解压 rootfs，返回是否成功。耗时操作，请在后台线程调用（调用方负责加锁）。 */
     fun prepareRootfs(progress: (String) -> Unit): Boolean {
-        val archive = findArchive()
+        SHARED_DIR.mkdirs()
+
+        var archive = findArchive()
         if (archive == null) {
-            progress("未找到 rootfs 压缩包。\n请把 Debian rootfs (.tar.gz / .tar.xz) 放到:\n${SHARED_DIR.path}\n放好后点侧边栏「+」重试。\n")
-            return false
+            archive = downloadRootfs(progress)
+            if (archive == null) {
+                progress("已取消自动下载。\n请手动把 Debian rootfs (.tar.gz / .tar.xz) 放到:\n${SHARED_DIR.path}\n放好后点侧边栏「+」重试。\n")
+                return false
+            }
         }
+
         progress("解压 ${archive.name} …\n")
         val tmp = File(ctx.filesDir, "rootfs.tmp")
         tmp.deleteRecursively()
@@ -122,6 +132,81 @@ class DebianTerminal(
             progress("解压失败: ${e.message}\n")
             tmp.deleteRecursively()
             false
+        }
+    }
+
+    /**
+     * 从 GitHub 拉取 debuerreotype 的 trixie rootfs 到 SHARED_DIR/rootfs.tar.gz。
+     * 不做断点续传（文件不大），失败会清掉 .part 文件。
+     */
+    private fun downloadRootfs(progress: (String) -> Unit): File? {
+        val target = File(SHARED_DIR, "rootfs.tar.gz")
+        val part = File(SHARED_DIR, "rootfs.tar.gz.part")
+        part.delete()
+
+        if (!SHARED_DIR.isDirectory && !SHARED_DIR.mkdirs()) {
+            progress("无法创建 ${SHARED_DIR.path}，请确认已授予「所有文件访问」权限。\n")
+            return null
+        }
+
+        progress("未找到 rootfs 压缩包，开始自动下载…\n$ROOTFS_URL\n")
+
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(ROOTFS_URL).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 20_000
+                readTimeout = 60_000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "MobileDebian/1.0 (Android)")
+            }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                progress("下载失败: HTTP $code\n")
+                part.delete()
+                return null
+            }
+            val total = conn.contentLengthLong
+            conn.inputStream.use { ins ->
+                FileOutputStream(part).use { fos ->
+                    val buf = ByteArray(1 shl 16)
+                    var got = 0L
+                    var lastReport = 0L
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        fos.write(buf, 0, n)
+                        got += n
+                        if (got - lastReport >= (1 shl 20)) {   // 每 1 MiB 刷一次
+                            lastReport = got
+                            val mb = got / 1048576.0
+                            val text = if (total > 0) {
+                                val tmb = total / 1048576.0
+                                val pct = (got * 100 / total).toInt()
+                                String.format(Locale.US, "\r\u001b[K下载中 %.1f/%.1f MB (%d%%)", mb, tmb, pct)
+                            } else {
+                                String.format(Locale.US, "\r\u001b[K下载中 %.1f MB", mb)
+                            }
+                            progress(text)
+                        }
+                    }
+                }
+            }
+            if (!part.renameTo(target)) {
+                target.delete()
+                if (!part.renameTo(target)) {
+                    progress("\n无法写入 ${target.path}\n")
+                    part.delete()
+                    return null
+                }
+            }
+            progress("\n下载完成：${target.name}\n")
+            target
+        } catch (e: Exception) {
+            progress("\n下载失败: ${e.message}\n")
+            part.delete()
+            null
+        } finally {
+            runCatching { conn?.disconnect() }
         }
     }
 
