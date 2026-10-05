@@ -14,7 +14,6 @@ import android.util.Base64
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -65,7 +64,6 @@ class TerminalUi(private val activity: Activity) {
 
     private val buffers = ConcurrentHashMap<Int, Buf>()
 
-    // 会话的显示名 + 状态
     private class ItemState(
         val row: LinearLayout,
         val dot: View,
@@ -83,18 +81,14 @@ class TerminalUi(private val activity: Activity) {
 
     private companion object {
         const val CHUNK = 32 * 1024
-        const val SIDEBAR_WIDTH_DP = 260
+        const val SIDEBAR_WIDTH_DP = 240
 
         val COLOR_BG          = Color.parseColor("#121212")
-        val COLOR_TOOLBAR     = Color.parseColor("#1A1A1A")
-        val COLOR_BTN         = Color.parseColor("#262626")
-        val COLOR_BTN_PRESS   = Color.parseColor("#333333")
-        val COLOR_TEXT        = Color.parseColor("#E0E0E0")
-        val COLOR_TEXT_DIM    = Color.parseColor("#8A8A8A")
-        val COLOR_SIDEBAR_BG  = Color.parseColor("#161616")
-        val COLOR_ITEM        = Color.parseColor("#212121")
-        val COLOR_ITEM_ACTIVE = Color.parseColor("#2A4A6E")
-        val COLOR_ACCENT      = Color.parseColor("#3A8DDE")
+        val COLOR_SIDEBAR_BG  = Color.parseColor("#181818")
+        val COLOR_ITEM        = Color.parseColor("#242424")
+        val COLOR_ITEM_ACTIVE = Color.parseColor("#2E3E52")
+        val COLOR_TEXT        = Color.WHITE
+        val COLOR_TEXT_DIM    = Color.parseColor("#888888")
         val COLOR_DOT_OK      = Color.parseColor("#4CAF50")
         val COLOR_DOT_DEAD    = Color.parseColor("#F44336")
     }
@@ -147,21 +141,16 @@ class TerminalUi(private val activity: Activity) {
         web = createWebView()
         main.addView(web, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // ---- 单行工具栏 ----
-        mainBar = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-            setBackgroundColor(COLOR_TOOLBAR)
-        }
-
-        mainBar.addView(toolBtn("☰") { toggleSidebar() })
-        ctrlButton = toolBtn("Ctrl") { setCtrl(!ctrl) }.also { mainBar.addView(it) }
+        // ---- 单行工具栏（恢复原样：透明按钮） ----
+        mainBar = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        mainBar.addView(button("☰") { toggleSidebar() })
+        ctrlButton = button("Ctrl") { setCtrl(!ctrl) }.also { mainBar.addView(it) }
 
         fun raw(label: String, seq: String) {
-            mainBar.addView(toolBtn(label) { onKey(currentId, seq) })
+            mainBar.addView(button(label) { onKey(currentId, seq) })
         }
         fun jsCall(label: String, code: String) {
-            mainBar.addView(toolBtn(label) { if (!destroyed) web.evaluateJavascript(code, null) })
+            mainBar.addView(button(label) { if (!destroyed) web.evaluateJavascript(code, null) })
         }
 
         raw("Esc", "\u001B")
@@ -176,13 +165,14 @@ class TerminalUi(private val activity: Activity) {
         raw("^D", "\u0004")
         jsCall("A-", "fontDeltaActive(-1)")
         jsCall("A+", "fontDeltaActive(1)")
-        mainBar.addView(toolBtn("复制") { web.evaluateJavascript("copySelectionOrAll()", null) })
-        mainBar.addView(toolBtn("粘贴") { paste() })
-        mainBar.addView(toolBtn("新建") { onNewSession() })
+        mainBar.addView(button("复制") { web.evaluateJavascript("copySelectionOrAll()", null) })
+        mainBar.addView(button("粘贴") { paste() })
+        mainBar.addView(button("新建") { onNewSession() })
 
         main.addView(
             HorizontalScrollView(activity).apply {
                 isHorizontalScrollBarEnabled = false
+                setBackgroundColor(Color.parseColor("#1E1E1E"))
                 addView(mainBar)
             },
             LinearLayout.LayoutParams(-1, -2)
@@ -205,41 +195,27 @@ class TerminalUi(private val activity: Activity) {
             visibility = View.GONE
         }
 
-        // 头部：标题 + 新建
+        // 头部
         val header = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(20), dp(20), dp(12), dp(14))
+            setPadding(dp(16), dp(16), dp(16), dp(10))
         }
         header.addView(
             TextView(activity).apply {
-                text = "终端"
-                setTextColor(Color.WHITE)
-                textSize = 20f
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                text = "终端列表"
+                setTextColor(COLOR_TEXT)
+                textSize = 16f
             },
             LinearLayout.LayoutParams(0, -2, 1f)
         )
-        header.addView(
-            Button(activity).apply {
-                text = "＋"
-                isAllCaps = false
-                textSize = 20f
-                minWidth = dp(40); minimumWidth = dp(40)
-                setPadding(0, 0, 0, 0)
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                background = rounded(COLOR_ACCENT, 20)
-                setOnClickListener { onNewSession() }
-            },
-            LinearLayout.LayoutParams(dp(40), dp(40))
-        )
+        header.addView(button("+") { onNewSession() })
         sidebar.addView(header)
 
         // 列表
         sessionList = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(4), 0, dp(8))
+            setPadding(0, 0, 0, dp(8))
         }
         sidebar.addView(
             ScrollView(activity).apply {
@@ -254,46 +230,30 @@ class TerminalUi(private val activity: Activity) {
         root.addView(sidebar, sidebarLp)
     }
 
-    // ---------------------------------------------------------- 按钮样式
+    // ---------------------------------------------------------- 按钮
 
-    /** 工具栏按钮：圆角灰底，按压变色。 */
-    private fun toolBtn(label: String, action: () -> Unit): Button {
-        val b = Button(activity).apply {
-            text = label
-            isAllCaps = false
-            minWidth = 0
-            minimumWidth = dp(44)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_TEXT)
-            background = rounded(COLOR_BTN, 8)
-            setOnClickListener { action() }
-        }
-        // 按压变色
-        b.setOnTouchListener { v, e ->
-            when (e.actionMasked) {
-                android.view.MotionEvent.ACTION_DOWN ->
-                    v.background = rounded(COLOR_BTN_PRESS, 8)
-                android.view.MotionEvent.ACTION_UP,
-                android.view.MotionEvent.ACTION_CANCEL ->
-                    v.background = rounded(COLOR_BTN, 8)
-            }
-            false
-        }
-        return b
+    /** 底栏按钮：透明底、白字、无圆角（和原来一样）。 */
+    private fun button(label: String, action: () -> Unit): Button = Button(activity).apply {
+        text = label
+        isAllCaps = false
+        minWidth = dp(46)
+        minimumWidth = dp(46)
+        gravity = Gravity.CENTER
+        setTextColor(Color.WHITE)
+        setBackgroundColor(Color.TRANSPARENT)
+        setOnClickListener { action() }
     }
 
-    /** 侧边栏里的小图标按钮（透明底）。 */
-    private fun iconBtn(label: String, color: Int, action: () -> Unit): Button =
+    /** 侧边栏里的小图标按钮（透明底、灰色字）。 */
+    private fun iconBtn(label: String, action: () -> Unit): Button =
         Button(activity).apply {
             text = label
             isAllCaps = false
-            minWidth = dp(32); minimumWidth = dp(32)
-            setPadding(0, 0, 0, 0)
-            textSize = 15f
+            minWidth = 0; minimumWidth = 0
+            setPadding(dp(6), 0, dp(6), 0)
+            textSize = 13f
             gravity = Gravity.CENTER
-            setTextColor(color)
+            setTextColor(COLOR_TEXT_DIM)
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { action() }
         }
@@ -327,37 +287,36 @@ class TerminalUi(private val activity: Activity) {
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(6), dp(12))
+            setPadding(dp(12), dp(10), dp(6), dp(10))
             isClickable = true
-            background = rounded(COLOR_ITEM, 12)
+            background = rounded(COLOR_ITEM, 8)
+            // ★ 卡片不铺满：左右各留 12dp 外边距
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply {
-                marginStart = dp(10); marginEnd = dp(10)
+                marginStart = dp(12); marginEnd = dp(12)
                 topMargin = dp(3); bottomMargin = dp(3)
             }
         }
 
         // 状态点
-        val dot = View(activity).apply {
-            background = circle(COLOR_DOT_OK)
-        }
+        val dot = View(activity).apply { background = circle(COLOR_DOT_OK) }
         row.addView(dot, LinearLayout.LayoutParams(dp(8), dp(8)).apply {
-            marginEnd = dp(12)
+            marginEnd = dp(10)
         })
 
         // 名称
         val label = TextView(activity).apply {
             text = name
-            setTextColor(Color.WHITE)
-            textSize = 15f
+            setTextColor(COLOR_TEXT)
+            textSize = 14f
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
         row.addView(label, LinearLayout.LayoutParams(0, -2, 1f))
 
-        // 编辑
-        row.addView(iconBtn("✎", COLOR_TEXT_DIM) { showRenameDialog(id) })
+        // ★ 重命名：用文字 "改名" 代替铅笔符号
+        row.addView(iconBtn("改名") { showRenameDialog(id) })
         // 关闭
-        row.addView(iconBtn("✕", COLOR_TEXT_DIM) { onCloseSession(id) })
+        row.addView(iconBtn("✕") { onCloseSession(id) })
 
         row.setOnClickListener { onSwitchSession(id) }
         row.setOnLongClickListener { showRenameDialog(id); true }
@@ -371,12 +330,11 @@ class TerminalUi(private val activity: Activity) {
         for ((id, st) in itemStates) {
             st.row.background = rounded(
                 if (id == currentId) COLOR_ITEM_ACTIVE else COLOR_ITEM,
-                12
+                8
             )
         }
     }
 
-    /** 更新某个终端的运行状态点。running=false 时点变红。 */
     fun setSessionStatus(id: Int, running: Boolean) {
         activity.runOnUiThread {
             itemStates[id]?.dot?.background = circle(
@@ -492,14 +450,11 @@ class TerminalUi(private val activity: Activity) {
         }
     }
 
-    // ---------------------------------------------------------- Ctrl 粘滞键
+    // ---------------------------------------------------------- Ctrl
 
     private fun setCtrl(on: Boolean) {
         ctrl = on
-        ctrlButton?.background = rounded(
-            if (on) COLOR_ACCENT else COLOR_BTN, 8
-        )
-        ctrlButton?.setTextColor(if (on) Color.WHITE else COLOR_TEXT)
+        ctrlButton?.setBackgroundColor(if (on) Color.parseColor("#3A6EA5") else Color.TRANSPARENT)
     }
 
     private fun applyCtrl(d: String): String {
