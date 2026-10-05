@@ -3,10 +3,12 @@ package com.mobiledeb
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
@@ -15,6 +17,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -25,7 +28,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -64,6 +66,9 @@ class TerminalUi(private val activity: Activity) {
 
     private val buffers = ConcurrentHashMap<Int, Buf>()
 
+    /** 已移除的标签 id：晚到的输出直接丢弃，不再重建缓冲区。 */
+    private val closedIds: MutableSet<Int> = ConcurrentHashMap.newKeySet<Int>()
+
     private class ItemState(
         val row: LinearLayout,
         val dot: View,
@@ -78,6 +83,7 @@ class TerminalUi(private val activity: Activity) {
     private var ctrlButton: Button? = null
 
     private var currentId = -1
+    private var sidebarOpen = false
 
     private companion object {
         const val CHUNK = 32 * 1024
@@ -90,6 +96,7 @@ class TerminalUi(private val activity: Activity) {
         val COLOR_SIDEBAR_BG  = Color.parseColor("#181818")
         val COLOR_ITEM        = Color.parseColor("#242424")
         val COLOR_ITEM_ACTIVE = Color.parseColor("#2E3E52")
+        val COLOR_CTRL_ON     = Color.parseColor("#3A6EA5")
         val COLOR_TEXT        = Color.WHITE
         val COLOR_TEXT_DIM    = Color.parseColor("#888888")
         val COLOR_DOT_OK      = Color.parseColor("#4CAF50")
@@ -112,6 +119,14 @@ class TerminalUi(private val activity: Activity) {
             setColor(color)
         }
 
+    /** 带按压涟漪的纯色背景（透明底也有反馈）。 */
+    private fun ripple(base: Int = Color.TRANSPARENT): RippleDrawable =
+        RippleDrawable(
+            ColorStateList.valueOf(0x33FFFFFF),
+            ColorDrawable(base),
+            ColorDrawable(Color.WHITE)
+        )
+
     // ---------------------------------------------------------- WebView
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -121,6 +136,8 @@ class TerminalUi(private val activity: Activity) {
         wv.overScrollMode = View.OVER_SCROLL_NEVER
         wv.settings.javaScriptEnabled = true
         wv.settings.allowContentAccess = false
+        // 不影响 file:///android_asset；若页面白屏，把这行删掉再试
+        wv.settings.allowFileAccess = false
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
         }
@@ -157,7 +174,7 @@ class TerminalUi(private val activity: Activity) {
             row.addView(v, LinearLayout.LayoutParams(0, -2, 1f))
         }
 
-        // 第一行：☰ Ctrl Esc Tab ^C ^D
+        // 第一行：☰ Ctrl Esc Tab ^C ^D 粘贴
         add(row1, toolBtn("☰") { toggleSidebar() })
         ctrlButton = toolBtn("Ctrl") { setCtrl(!ctrl) }
         add(row1, ctrlButton!!)
@@ -165,6 +182,7 @@ class TerminalUi(private val activity: Activity) {
         add(row1, toolBtn("Tab") { onKey(currentId, "\t") })
         add(row1, toolBtn("^C") { onKey(currentId, "\u0003") })
         add(row1, toolBtn("^D") { onKey(currentId, "\u0004") })
+        add(row1, toolBtn("粘贴") { paste() })
 
         // 第二行：A- A+ ↑ ↓ ← → ⌫
         add(row2, toolBtn("A-") {
@@ -173,10 +191,11 @@ class TerminalUi(private val activity: Activity) {
         add(row2, toolBtn("A+") {
             if (!destroyed) web.evaluateJavascript("fontDeltaActive(1)", null)
         })
-        add(row2, repeatBtn("↑") { onKey(currentId, "\u001B[A") })
-        add(row2, repeatBtn("↓") { onKey(currentId, "\u001B[B") })
-        add(row2, repeatBtn("←") { onKey(currentId, "\u001B[D") })
-        add(row2, repeatBtn("→") { onKey(currentId, "\u001B[C") })
+        // 方向键交给 JS 的 arrowActive：它会按 application cursor 模式选 ESC[ / ESC O
+        add(row2, repeatBtn("↑") { arrow('A') })
+        add(row2, repeatBtn("↓") { arrow('B') })
+        add(row2, repeatBtn("←") { arrow('D') })
+        add(row2, repeatBtn("→") { arrow('C') })
         add(row2, repeatBtn("⌫") { onKey(currentId, "\u007F") })
 
         toolbar.addView(row1, LinearLayout.LayoutParams(-1, -2))
@@ -247,7 +266,7 @@ class TerminalUi(private val activity: Activity) {
             textSize = 12f
             gravity = Gravity.CENTER
             setTextColor(COLOR_TEXT)
-            setBackgroundColor(Color.TRANSPARENT)
+            background = ripple()
             setOnClickListener { action() }
         }
 
@@ -262,7 +281,7 @@ class TerminalUi(private val activity: Activity) {
             textSize = 13f
             gravity = Gravity.CENTER
             setTextColor(COLOR_TEXT)
-            setBackgroundColor(Color.TRANSPARENT)
+            background = ripple()
         }
         b.setOnTouchListener(object : View.OnTouchListener {
             private var pressed = false
@@ -307,7 +326,7 @@ class TerminalUi(private val activity: Activity) {
             textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(COLOR_TEXT)
-            setBackgroundColor(Color.TRANSPARENT)
+            background = ripple()
             setOnClickListener { action() }
         }
 
@@ -322,17 +341,24 @@ class TerminalUi(private val activity: Activity) {
             textSize = 13f
             gravity = Gravity.CENTER
             setTextColor(COLOR_TEXT_DIM)
-            setBackgroundColor(Color.TRANSPARENT)
+            background = ripple()
             setOnClickListener { action() }
         }
+
+    private fun arrow(c: Char) {
+        if (!destroyed && webReady) web.evaluateJavascript("arrowActive('$c')", null)
+    }
 
     // ---------------------------------------------------------- 侧边栏
 
     private fun toggleSidebar() {
-        if (sidebar.visibility == View.VISIBLE) hideSidebar() else showSidebar()
+        if (sidebarOpen) hideSidebar() else showSidebar()
     }
 
     private fun showSidebar() {
+        // 先 cancel：会同步触发上一次 hide 的 endAction，随后再置为可见，顺序不会反
+        sidebar.animate().cancel()
+        sidebarOpen = true
         sidebar.visibility = View.VISIBLE
         scrim.visibility = View.VISIBLE
         sidebar.translationX = -dp(SIDEBAR_WIDTH_DP).toFloat()
@@ -340,15 +366,26 @@ class TerminalUi(private val activity: Activity) {
     }
 
     private fun hideSidebar() {
-        if (sidebar.visibility != View.VISIBLE) return
+        if (!sidebarOpen) return
+        sidebarOpen = false
+        sidebar.animate().cancel()
         sidebar.animate()
             .translationX(-dp(SIDEBAR_WIDTH_DP).toFloat())
             .setDuration(200)
             .withEndAction {
-                sidebar.visibility = View.GONE
-                scrim.visibility = View.GONE
+                if (!sidebarOpen) {
+                    sidebar.visibility = View.GONE
+                    scrim.visibility = View.GONE
+                }
             }
             .start()
+    }
+
+    /** 返回键：侧栏开着就先关侧栏。返回 true 表示已处理。 */
+    fun handleBack(): Boolean {
+        if (!sidebarOpen) return false
+        hideSidebar()
+        return true
     }
 
     private fun makeSessionItem(id: Int, name: String): View {
@@ -437,6 +474,7 @@ class TerminalUi(private val activity: Activity) {
     // ---------------------------------------------------------- 会话 API
 
     fun createTab(id: Int, name: String, activate: Boolean) {
+        closedIds.remove(id)
         sessionList.addView(makeSessionItem(id, name))
         if (activate) currentId = id
         refreshActiveHighlight()
@@ -453,6 +491,7 @@ class TerminalUi(private val activity: Activity) {
     }
 
     fun removeTab(id: Int) {
+        closedIds.add(id)
         val st = itemStates.remove(id)
         if (st != null) sessionList.removeView(st.row)
         sessionNames.remove(id)
@@ -468,11 +507,8 @@ class TerminalUi(private val activity: Activity) {
     // ---------------------------------------------------------- 输出
 
     fun writeBytes(id: Int, b: ByteArray) {
-        var buf = buffers[id]
-        if (buf == null) {
-            buf = Buf()
-            buffers[id] = buf
-        }
+        if (id in closedIds) return
+        val buf = buffers.computeIfAbsent(id) { Buf() }
         synchronized(buf) { buf.baos.write(b, 0, b.size) }
         scheduleFlush(id, buf)
     }
@@ -480,11 +516,6 @@ class TerminalUi(private val activity: Activity) {
     fun printText(id: Int, s: String) {
         val n = s.replace("\r\n", "\n").replace("\n", "\r\n")
         writeBytes(id, n.toByteArray(Charsets.UTF_8))
-    }
-
-    fun printGlobalText(s: String) {
-        val n = s.replace("\r\n", "\n").replace("\n", "\r\n")
-        if (currentId >= 0) writeBytes(currentId, n.toByteArray(Charsets.UTF_8))
     }
 
     private fun scheduleFlush(id: Int, buf: Buf) {
@@ -517,7 +548,7 @@ class TerminalUi(private val activity: Activity) {
 
     private fun setCtrl(on: Boolean) {
         ctrl = on
-        ctrlButton?.setBackgroundColor(if (on) Color.parseColor("#3A6EA5") else Color.TRANSPARENT)
+        ctrlButton?.background = ripple(if (on) COLOR_CTRL_ON else Color.TRANSPARENT)
     }
 
     private fun applyCtrl(d: String): String {
@@ -542,7 +573,7 @@ class TerminalUi(private val activity: Activity) {
     // ---------------------------------------------------------- 剪贴板
 
     private fun paste() {
-        if (destroyed) return
+        if (destroyed || !webReady) return
         val cm = activity.getSystemService(ClipboardManager::class.java)
         val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
             ?.getItemAt(0)?.coerceToText(activity)?.toString()
@@ -554,6 +585,10 @@ class TerminalUi(private val activity: Activity) {
     fun destroy() {
         destroyed = true
         handler.removeCallbacksAndMessages(null)
+        web.stopLoading()
+        web.removeJavascriptInterface("Android")
+        // WebView 必须先从父容器摘下再 destroy，否则会有 "destroy() called while still attached"
+        (web.parent as? ViewGroup)?.removeView(web)
         web.destroy()
     }
 
@@ -595,24 +630,9 @@ class TerminalUi(private val activity: Activity) {
             activity.runOnUiThread {
                 if (destroyed) return@runOnUiThread
                 webReady = true
+                // 页面就绪前积压的输出此前没人触发 flush，这里补一次
+                for ((id, buf) in buffers) scheduleFlush(id, buf)
                 onPageReady()
-            }
-        }
-
-        @JavascriptInterface
-        fun onSelection(text: String) {
-            if (text.isEmpty()) return
-            activity.runOnUiThread {
-                val cm = activity.getSystemService(ClipboardManager::class.java)
-                cm?.setPrimaryClip(ClipData.newPlainText("terminal", text))
-                Toast.makeText(activity, "已复制 ${text.length} 字符", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        @JavascriptInterface
-        fun onToast(text: String) {
-            activity.runOnUiThread {
-                Toast.makeText(activity, text, Toast.LENGTH_SHORT).show()
             }
         }
     }
