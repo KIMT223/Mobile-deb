@@ -1,22 +1,38 @@
-# Mobile Debian (com.mobiledeb)
+Mobile Deb
 
-1. 用 Android Studio 打开本目录（会自动生成 gradle wrapper 并同步）。
-2. 按 app/src/main/jniLibs/arm64-v8a/README.txt 放入 proot 文件。
-3. 手机上把 Debian arm64 rootfs 压缩包 (.tar.gz/.tgz/.tar.xz) 放到
-   /storage/emulated/0/mobile_deb/
-4. 安装运行，授予「所有文件访问」权限，首次启动自动解压到应用内部存储。
+在 Android 上运行 Debian。
 
-Debian 内 /mnt/shared 即共享目录 /storage/emulated/0/mobile_deb/
+Mobile Deb 是一个面向 Android 的开源 Debian 运行环境，无需 Root，即可在手机上使用 Debian ARM64 用户空间。
 
-## 终端界面 (WebView + xterm.js)
+功能
 
-xterm.js 不放进仓库，由 GitHub Actions 构建时自动下载到 `app/src/main/assets/xterm/`。
-本地用 Android Studio 构建时，先手动执行一次：
+- 运行 Debian ARM64
+- 提供内置终端
+- 与 Android 共享文件
+- 基于 PRoot 运行，无需 Root
+- 支持安装和使用 Debian 软件包
+- 免费、开源
 
-```bash
-mkdir -p /tmp/xt app/src/main/assets/xterm
-cd /tmp/xt && npm init -y && npm install @xterm/xterm@5.5.0 @xterm/addon-fit@0.10.0 && cd -
-cp /tmp/xt/node_modules/@xterm/xterm/lib/xterm.js        app/src/main/assets/xterm/
-cp /tmp/xt/node_modules/@xterm/xterm/css/xterm.css       app/src/main/assets/xterm/
-cp /tmp/xt/node_modules/@xterm/addon-fit/lib/addon-fit.js app/src/main/assets/xterm/
-```
+用途
+
+Mobile Deb 可以让你的 Android 手机拥有一个便携的 Debian 环境。
+
+你可以用它：
+
+- 使用 Linux 命令行工具
+- 安装 Debian 软件包
+- 编写和运行程序
+- 管理文件
+- 搭建自己的移动开发环境
+
+简单来说：
+
+«把 Debian 带在口袋里。»
+
+开源
+
+Mobile Deb 是自由、开源软件。
+
+本项目采用 GPLv3 开源许可证。
+
+详见 ""LICENSE"" (LICENSE)。
