@@ -2,6 +2,7 @@ package com.mobiledeb
 
 import android.content.Context
 import android.os.FileObserver
+import android.os.SystemClock
 import android.system.Os
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
@@ -13,6 +14,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -45,6 +47,9 @@ class DebianTerminal(
     private val ttyBasename = ".mdtty-$id"
 
     private val rootfsDir = File(ctx.filesDir, "rootfs")
+    private val shmDir = File(ctx.filesDir, "shm")
+    private val fakeProcDir = File(ctx.filesDir, "procfake")
+    @Volatile private var extraBinds: List<String> = emptyList()
     @Volatile private var process: Process? = null
     @Volatile private var stdin: OutputStream? = null
     @Volatile private var rootDir: File? = null
@@ -194,6 +199,7 @@ class DebianTerminal(
         if (full) {
             cmd += listOf("-b", "/sys")
             if (SHARED_DIR.isDirectory) cmd += listOf("-b", "${SHARED_DIR.path}:/mnt/shared")
+            cmd += extraBinds
         }
         return cmd
     }
@@ -210,6 +216,60 @@ class DebianTerminal(
         }
     }
 
+    // ------------------------------------------------- /dev/shm 与伪造的 /proc 文件
+
+    private fun readable(path: String): Boolean =
+        runCatching { FileInputStream(path).use { it.read() }; true }.getOrDefault(false)
+
+    /**
+     * Android 没有 /dev/shm，且 8+ 起普通应用读不了 /proc/stat、/proc/loadavg 等。
+     * 这里准备：
+     *  - filesDir/shm（1777）→ 绑到 /dev/shm
+     *  - 宿主上读不了的 /proc 文件，用占位内容的文件覆盖（能读就不动它）
+     * 返回要追加给 proot 的 -b 参数。数值是占位的：CPU 核数取真实值，使用率/负载恒为 0。
+     */
+    private fun prepareExtraBinds(): List<String> {
+        val args = mutableListOf<String>()
+
+        runCatching {
+            shmDir.mkdirs()
+            Os.chmod(shmDir.path, 0x3FF)            // 01777
+            args += listOf("-b", "${shmDir.path}:/dev/shm")
+        }
+
+        runCatching {
+            fakeProcDir.mkdirs()
+            val upMs = SystemClock.elapsedRealtime()
+            val up = String.format(Locale.US, "%.2f", upMs / 1000.0)
+            val ticks = upMs / 10                   // USER_HZ = 100
+            val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            val btime = (System.currentTimeMillis() - upMs) / 1000
+
+            fun fake(name: String, content: String) {
+                if (readable("/proc/$name")) return
+                val f = File(fakeProcDir, name)
+                f.writeText(content)
+                args += listOf("-b", "${f.path}:/proc/$name")
+            }
+
+            val user = ticks / 4
+            val sys = ticks / 8
+            val idle = ticks - user - sys
+            val per = "$user 0 $sys $idle 0 0 0 0 0 0"
+            val total = "${user * cores} 0 ${sys * cores} ${idle * cores} 0 0 0 0 0 0"
+            val stat = StringBuilder("cpu  $total\n")
+            for (i in 0 until cores) stat.append("cpu$i $per\n")
+            stat.append("intr 0\nctxt 0\nbtime $btime\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n")
+
+            fake("stat", stat.toString())
+            fake("loadavg", "0.00 0.00 0.00 1/100 1\n")
+            fake("uptime", "$up $up\n")
+            fake("version", "Linux version 6.1.0-mobiledeb (build@localhost) (gcc) #1 SMP PREEMPT\n")
+        }
+
+        return args
+    }
+
     // --------------------------------------------------------------- process
 
     fun start() {
@@ -217,6 +277,7 @@ class DebianTerminal(
         if (root == null) {
             onMessage("rootfs 未就绪\n"); onExit(-1); return
         }
+        extraBinds = prepareExtraBinds()
         val cmd = prootBase(root, true)
         if (cmd == null) {
             onMessage("缺少 libproot.so（应放在 jniLibs/arm64-v8a/）\n"); onExit(-1); return
