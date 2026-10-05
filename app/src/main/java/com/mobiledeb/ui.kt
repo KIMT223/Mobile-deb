@@ -3,7 +3,6 @@ package com.mobiledeb
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.ClipboardManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -28,7 +27,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 
@@ -80,7 +78,9 @@ class TerminalUi(private val activity: Activity) {
     @Volatile private var webReady = false
     @Volatile private var destroyed = false
     @Volatile private var ctrl = false
+    @Volatile private var alt = false
     private var ctrlButton: Button? = null
+    private var altButton: Button? = null
 
     private var currentId = -1
     private var sidebarOpen = false
@@ -174,15 +174,16 @@ class TerminalUi(private val activity: Activity) {
             row.addView(v, LinearLayout.LayoutParams(0, -2, 1f))
         }
 
-        // 第一行：☰ Ctrl Esc Tab ^C ^D 粘贴
+        // 第一行：☰ Ctrl Alt Esc Tab ^C ^D
         add(row1, toolBtn("☰") { toggleSidebar() })
         ctrlButton = toolBtn("Ctrl") { setCtrl(!ctrl) }
         add(row1, ctrlButton!!)
+        altButton = toolBtn("Alt") { setAlt(!alt) }
+        add(row1, altButton!!)
         add(row1, toolBtn("Esc") { onKey(currentId, "\u001B") })
         add(row1, toolBtn("Tab") { onKey(currentId, "\t") })
         add(row1, toolBtn("^C") { onKey(currentId, "\u0003") })
         add(row1, toolBtn("^D") { onKey(currentId, "\u0004") })
-        add(row1, toolBtn("粘贴") { paste() })
 
         // 第二行：A- A+ ↑ ↓ ← → ⌫
         add(row2, toolBtn("A-") {
@@ -191,7 +192,8 @@ class TerminalUi(private val activity: Activity) {
         add(row2, toolBtn("A+") {
             if (!destroyed) web.evaluateJavascript("fontDeltaActive(1)", null)
         })
-        // 方向键交给 JS 的 arrowActive：它会按 application cursor 模式选 ESC[ / ESC O
+        // 方向键交给 JS 的 arrowActive：无修饰按 application cursor 模式选 ESC[ / ESC O，
+        // 带 Ctrl/Alt 修饰时用 CSI 参数形式（mod 值 = 1 + Shift + Alt*2 + Ctrl*4）
         add(row2, repeatBtn("↑") { arrow('A') })
         add(row2, repeatBtn("↓") { arrow('B') })
         add(row2, repeatBtn("←") { arrow('D') })
@@ -345,8 +347,18 @@ class TerminalUi(private val activity: Activity) {
             setOnClickListener { action() }
         }
 
+    /**
+     * 方向键：带上 Ctrl/Alt 时一次性编码进 CSI 参数（mod 值 = 1 + Shift + Alt*2 + Ctrl*4），
+     * 由 JS 决定用 CSI 参数形式还是 application cursor 前缀。
+     */
     private fun arrow(c: Char) {
-        if (!destroyed && webReady) web.evaluateJavascript("arrowActive('$c')", null)
+        if (destroyed || !webReady) return
+        var mod = 1
+        if (alt) mod += 2
+        if (ctrl) mod += 4
+        val needsMod = mod > 1
+        clearMods()
+        web.evaluateJavascript("arrowActive('$c', ${if (needsMod) mod else 0})", null)
     }
 
     // ---------------------------------------------------------- 侧边栏
@@ -544,42 +556,54 @@ class TerminalUi(private val activity: Activity) {
         }
     }
 
-    // ---------------------------------------------------------- Ctrl
+    // ---------------------------------------------------------- 修饰键（Ctrl / Alt）
 
     private fun setCtrl(on: Boolean) {
         ctrl = on
         ctrlButton?.background = ripple(if (on) COLOR_CTRL_ON else Color.TRANSPARENT)
     }
 
-    private fun applyCtrl(d: String): String {
-        if (!ctrl || d.length != 1) return d
-        val c = d[0]
-        val code = when (c) {
-            in 'a'..'z' -> c.code - 96
-            in 'A'..'Z' -> c.code - 64
-            '[' -> 27
-            '\\' -> 28
-            ']' -> 29
-            '^' -> 30
-            '_' -> 31
-            ' ', '@' -> 0
-            else -> -1
-        }
-        ctrl = false
-        activity.runOnUiThread { setCtrl(false) }
-        return if (code >= 0) code.toChar().toString() else d
+    private fun setAlt(on: Boolean) {
+        alt = on
+        altButton?.background = ripple(if (on) COLOR_CTRL_ON else Color.TRANSPARENT)
     }
 
-    // ---------------------------------------------------------- 剪贴板
-
-    private fun paste() {
-        if (destroyed || !webReady) return
-        val cm = activity.getSystemService(ClipboardManager::class.java)
-        val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)?.coerceToText(activity)?.toString()
-        if (!text.isNullOrEmpty()) {
-            web.evaluateJavascript("pasteActive(${JSONObject.quote(text)})", null)
+    /** 修饰键是一次性的，输入后自动弹起。 */
+    private fun clearMods() {
+        if (!ctrl && !alt) return
+        ctrl = false
+        alt = false
+        activity.runOnUiThread {
+            setCtrl(false)
+            setAlt(false)
         }
+    }
+
+    /**
+     * 软键盘输入：Ctrl 转控制码、Alt 加 ESC 前缀，两者可叠加；消费后自动清空。
+     * 多字符（输入法合成等）只处理 Alt 前缀，Ctrl 不做转义。
+     */
+    private fun applyMod(d: String): String {
+        if (!ctrl && !alt) return d
+        val hadCtrl = ctrl
+        val hadAlt = alt
+        clearMods()
+        if (d.isEmpty()) return d
+
+        var out = d
+        if (hadCtrl && d.length == 1) {
+            val c = d[0]
+            val code = when (c) {
+                in 'a'..'z' -> c.code - 96
+                in 'A'..'Z' -> c.code - 64
+                '[' -> 27; '\\' -> 28; ']' -> 29; '^' -> 30; '_' -> 31
+                ' ', '@' -> 0
+                else -> -1
+            }
+            if (code >= 0) out = code.toChar().toString()
+        }
+        if (hadAlt) out = "\u001B$out"
+        return out
     }
 
     fun destroy() {
@@ -599,7 +623,7 @@ class TerminalUi(private val activity: Activity) {
         fun input(id: String, d: String) {
             if (destroyed) return
             val i = id.toIntOrNull() ?: return
-            onInput(i, applyCtrl(d))
+            onInput(i, applyMod(d))
         }
 
         @JavascriptInterface
