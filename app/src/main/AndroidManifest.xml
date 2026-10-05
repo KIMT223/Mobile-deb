@@ -12,6 +12,8 @@
 
     <application
         android:label="Mobile Debian"
+        android:icon="@drawable/icon"
+        android:roundIcon="@drawable/icon"
         android:extractNativeLibs="true"
         android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
