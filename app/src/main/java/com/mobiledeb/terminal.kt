@@ -13,21 +13,23 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 /**
  * 单个 proot + Debian 会话。一个实例对应一个终端。
- * 多个实例可以共享同一份 rootfs（filesDir/rootfs），rootfs 的首次解压由 MainActivity 全局保证只做一次。
+ * 多个实例共享同一份 rootfs（filesDir/rootfs），首次解压由 TerminalService 加锁保证只做一次。
  *
- * 终端大小同步：rootfs 里用 script 分配 PTY，并把 PTY 设备名写到 /tmp/.mdtty；
- * 窗口大小变化时另起一个 proot 执行 `stty -F <pty> rows R cols C`，内核会自动给 bash 发 SIGWINCH。
+ * 终端大小同步：rootfs 里用 script 分配 PTY，并把 PTY 设备名写到 /tmp/.mdtty-<id>
+ * （每个会话一个文件，避免多会话互相覆盖）；窗口大小变化时另起一个 proot 执行
+ * `stty -F <pty> rows R cols C`，内核会自动给 bash 发 SIGWINCH。
  */
 class DebianTerminal(
     private val ctx: Context,
+    private val id: Int,
     private val onOutput: (ByteArray) -> Unit,
     private val onMessage: (String) -> Unit,
     private val onExit: (Int) -> Unit,
@@ -36,10 +38,11 @@ class DebianTerminal(
         val SHARED_DIR = File("/storage/emulated/0/mobile_deb")
         private const val PATH_ENV =
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        private const val TTY_FILE = "tmp/.mdtty"
-        private const val TTY_BASENAME = ".mdtty"
         private const val RESIZE_TIMEOUT_MS = 8000L
     }
+
+    private val ttyRel = "tmp/.mdtty-$id"
+    private val ttyBasename = ".mdtty-$id"
 
     private val rootfsDir = File(ctx.filesDir, "rootfs")
     @Volatile private var process: Process? = null
@@ -48,6 +51,7 @@ class DebianTerminal(
     @Volatile private var supportsResize = false
     @Volatile private var wantedSize: Pair<Int, Int>? = null
     @Volatile private var appliedSize: Pair<Int, Int>? = null
+    @Volatile private var stopped = false
 
     // stop() 后会关闭这两个 executor，start() 时按需重建，避免二次启动时被拒绝。
     private val execLock = Any()
@@ -84,7 +88,7 @@ class DebianTerminal(
             ?.sortedBy { it.name }
             ?.firstOrNull()
 
-    /** 解压 rootfs，返回是否成功。耗时操作，请在后台线程调用。 */
+    /** 解压 rootfs，返回是否成功。耗时操作，请在后台线程调用（调用方负责加锁）。 */
     fun prepareRootfs(progress: (String) -> Unit): Boolean {
         val archive = findArchive()
         if (archive == null) {
@@ -116,6 +120,12 @@ class DebianTerminal(
         }
     }
 
+    private fun inside(f: File, destPath: String): Boolean = try {
+        (f.canonicalPath + File.separator).startsWith(destPath)
+    } catch (_: IOException) {
+        false
+    }
+
     private fun extract(archive: File, dest: File, progress: (String) -> Unit) {
         val raw = BufferedInputStream(FileInputStream(archive), 1 shl 16)
         val decompressed: InputStream =
@@ -131,9 +141,7 @@ class DebianTerminal(
                 if (name.isNotEmpty()) {
                     val out = File(dest, name)
                     val outParent = out.parentFile
-                    if (outParent == null ||
-                        !(outParent.canonicalPath + File.separator).startsWith(destPath)
-                    ) {
+                    if (outParent == null || !inside(outParent, destPath)) {
                         e = tar.nextTarEntry
                         continue
                     }
@@ -149,11 +157,14 @@ class DebianTerminal(
                             if (!ok) runCatching { out.writeText(e.linkName) }
                         }
                         e.isLink -> {
-                            out.parentFile?.mkdirs()
-                            out.delete()
+                            // 硬链接目标必须在解压目录内，防止借 ../ 读取/链接到外部文件
                             val target = File(dest, e.linkName.removePrefix("./"))
-                            val ok = runCatching { Os.link(target.path, out.path) }.isSuccess
-                            if (!ok) runCatching { target.copyTo(out, overwrite = true) }
+                            if (inside(target, destPath)) {
+                                out.parentFile?.mkdirs()
+                                out.delete()
+                                val ok = runCatching { Os.link(target.path, out.path) }.isSuccess
+                                if (!ok) runCatching { target.copyTo(out, overwrite = true) }
+                            }
                         }
                         e.isFile -> {
                             out.parentFile?.mkdirs()
@@ -211,6 +222,7 @@ class DebianTerminal(
             onMessage("缺少 libproot.so（应放在 jniLibs/arm64-v8a/）\n"); onExit(-1); return
         }
 
+        stopped = false
         ensureExecutors()
         rootDir = root
         appliedSize = null
@@ -224,13 +236,13 @@ class DebianTerminal(
             }
         }
         File(root, "tmp").mkdirs()
-        File(root, TTY_FILE).delete()
+        File(root, ttyRel).delete()
 
         val hasScript = File(root, "usr/bin/script").exists()
         supportsResize = hasScript && File(root, "usr/bin/stty").exists()
         val shell =
             if (hasScript)
-                listOf("/usr/bin/script", "-qfc", "tty > /$TTY_FILE; exec /bin/bash -l", "/dev/null")
+                listOf("/usr/bin/script", "-qfc", "tty > /$ttyRel; exec /bin/bash -l", "/dev/null")
             else listOf("/bin/bash", "-i")
 
         if (!supportsResize) {
@@ -261,13 +273,13 @@ class DebianTerminal(
                     while (true) {
                         val n = ins.read(buf)
                         if (n < 0) break
-                        onOutput(buf.copyOf(n))
+                        if (!stopped) onOutput(buf.copyOf(n))
                     }
                 } catch (_: IOException) {
                 }
                 val code = try { p.waitFor() } catch (_: InterruptedException) { -1 }
-                onExit(code)
-            }.apply { isDaemon = true; name = "debian-stdout" }.start()
+                if (!stopped) onExit(code)
+            }.apply { isDaemon = true; name = "debian-stdout-$id" }.start()
 
             if (supportsResize && wantedSize != null) triggerResize()
         } catch (e: Exception) {
@@ -330,32 +342,37 @@ class DebianTerminal(
         }
     }
 
+    /**
+     * 等待 shell 把 PTY 设备名写进 tty 文件。
+     * 用 Semaphore 而不是 latch：事件消费后会重新阻塞，文件还是空的那段时间不会空转。
+     */
     private fun waitForTtyFile(root: File, timeoutMs: Long, stillValid: () -> Boolean): String? {
-        val ttyFile = File(root, TTY_FILE)
+        val ttyFile = File(root, ttyRel)
         readTtyPath(ttyFile)?.let { return it }
 
         val tmpDir = File(root, "tmp")
         if (!tmpDir.isDirectory) return null
 
-        val latch = CountDownLatch(1)
+        val sem = Semaphore(0)
         @Suppress("DEPRECATION")
         val observer = object : FileObserver(
             tmpDir.absolutePath,
             CREATE or MOVED_TO or CLOSE_WRITE or MODIFY
         ) {
             override fun onEvent(event: Int, path: String?) {
-                if (path == TTY_BASENAME) latch.countDown()
+                if (path == ttyBasename) sem.release()
             }
         }
         observer.startWatching()
         try {
             readTtyPath(ttyFile)?.let { return it }
             val deadline = System.currentTimeMillis() + timeoutMs
-            while (System.currentTimeMillis() < deadline) {
+            while (true) {
                 if (!stillValid()) return null
                 val remaining = deadline - System.currentTimeMillis()
                 if (remaining <= 0) break
-                latch.await(minOf(remaining, 200L), TimeUnit.MILLISECONDS)
+                sem.tryAcquire(minOf(remaining, 200L), TimeUnit.MILLISECONDS)
+                sem.drainPermits()
                 readTtyPath(ttyFile)?.let { return it }
             }
         } catch (_: InterruptedException) {
@@ -376,6 +393,7 @@ class DebianTerminal(
     fun isRunning() = process?.isAlive == true
 
     fun stop() {
+        stopped = true
         val p = process
         val s = stdin
         process = null
