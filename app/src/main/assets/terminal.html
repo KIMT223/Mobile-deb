@@ -31,7 +31,6 @@
     line-height: 1.2;
     margin: 0;
     padding: 0;
-    /* 让浏览器知道这里可以选 */
     touch-action: pan-y;
   }
   .text-layer .tl-row {
@@ -42,7 +41,14 @@
     font-size: inherit;
     overflow: hidden;
   }
-  /* 用户选中后，让选区真正可见（默认选中的文本会自动反色显示） */
+  /* 宽字符 / 非 ASCII：固定占 N 个单元格，选区才能和下面的字符对齐 */
+  .text-layer .tl-wide {
+    display: inline-block;
+    overflow: hidden;
+    letter-spacing: 0;
+    vertical-align: top;
+    white-space: pre;
+  }
   .text-layer ::selection {
     background: rgba(58, 110, 165, 0.7);
     color: transparent;
@@ -75,15 +81,31 @@
     return def;
   }
 
+  // 渲染器还没测量（或终端处于 display:none）时尺寸是 0，必须当作「不可用」
   function getCellDims(term) {
     try {
       var core = term._core || term.core;
       var dims = core && core._renderService && core._renderService.dimensions;
-      if (dims && dims.css && dims.css.cell) {
-        return { w: dims.css.cell.width, h: dims.css.cell.height };
-      }
+      var c = dims && dims.css && dims.css.cell;
+      if (c && c.width > 0 && c.height > 0) return { w: c.width, h: c.height };
     } catch (e) {}
     return null;
+  }
+
+  var measureCtx = null;
+  function measureCharWidth(fam, fs) {
+    try {
+      if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+      measureCtx.font = fs + 'px ' + fam;
+      var s = 'M'.repeat(100);
+      return measureCtx.measureText(s).width / 100;
+    } catch (e) {}
+    return 0;
+  }
+
+  function hasSelection() {
+    try { return window.getSelection().toString().length > 0; } catch (e) {}
+    return false;
   }
 
   // -------------------------------------------------- 创建终端
@@ -128,14 +150,17 @@
       rows: 0,
       fontSize: 0,
       lineHeight: 0,
+      cellW: 0,
+      cell: null,
+      syncQueued: false,
     };
     terms.set(id, entry);
 
-    // 渲染事件 → 同步文本层
-    if (typeof term.onRender === 'function')      term.onRender(function ()      { syncTextLayer(id); });
-    if (typeof term.onWriteParsed === 'function') term.onWriteParsed(function () { syncTextLayer(id); });
-    if (typeof term.onScroll === 'function')      term.onScroll(function ()      { syncTextLayer(id); });
-    if (typeof term.onResize === 'function')      term.onResize(function ()      { syncTextLayer(id); });
+    // 渲染事件 → 合并到下一帧同步文本层
+    if (typeof term.onRender === 'function')      term.onRender(function ()      { scheduleSync(id); });
+    if (typeof term.onWriteParsed === 'function') term.onWriteParsed(function () { scheduleSync(id); });
+    if (typeof term.onScroll === 'function')      term.onScroll(function ()      { scheduleSync(id); });
+    if (typeof term.onResize === 'function')      term.onResize(function ()      { scheduleSync(id); });
 
     if (activeId === null) {
       activeId = id;
@@ -197,10 +222,17 @@
     const fam = getOpt(term, 'fontFamily', 'monospace');
     const dims = getCellDims(term);
     const lineHeight = dims ? dims.h : Math.round(fs * 1.2);
+    const cellW = dims ? dims.w : 0;
+
+    // xterm 的单元格宽度会按设备像素取整，DOM 文本用的是精确字宽；
+    // 用 letter-spacing 补差，否则一行 80 列走下来选区会明显偏移
+    const adv = measureCharWidth(fam, fs);
+    const ls = (cellW > 0 && adv > 0) ? (cellW - adv) : 0;
 
     layer.style.fontFamily = fam;
     layer.style.fontSize = fs + 'px';
     layer.style.lineHeight = lineHeight + 'px';
+    layer.style.letterSpacing = ls + 'px';
 
     for (let r = 0; r < term.rows; r++) {
       const row = document.createElement('div');
@@ -215,71 +247,131 @@
     t.rows = term.rows;
     t.fontSize = fs;
     t.lineHeight = lineHeight;
+    t.cellW = cellW;
 
     // 点击文本层 → 弹软键盘（不是长按）
     layer.addEventListener('click', function () {
-      // 如果有选中内容，不清除焦点
       try { term.focus(); } catch (e) {}
     });
 
-    // 单指滑动 → 滚动终端（避免把滚动吃掉）
+    // 单指滑动 → 滚动终端
     let lastY = 0;
     let dragging = false;
     layer.addEventListener('touchstart', function (e) {
       if (e.touches.length !== 1) return;
-      // 有选择中就不滚动
-      try {
-        if (window.getSelection().toString().length > 0) return;
-      } catch (err) {}
+      if (hasSelection()) return;
       lastY = e.touches[0].clientY;
       dragging = true;
     }, { passive: true });
     layer.addEventListener('touchmove', function (e) {
       if (!dragging || e.touches.length !== 1) return;
-      try {
-        if (window.getSelection().toString().length > 0) return;
-      } catch (err) {}
+      if (hasSelection()) return;
       const y = e.touches[0].clientY;
       const dy = lastY - y;
       const lh = t.lineHeight || 16;
       const lines = Math.trunc(dy / lh);
       if (lines !== 0) {
         try { term.scrollLines(lines); } catch (err) {}
-        lastY = y - (dy % lh);
+        // 只消耗掉已经滚过的整行，余数留给下一次 move（符号是 +，不是 -）
+        lastY = y + (dy % lh);
       }
     }, { passive: true });
     layer.addEventListener('touchend', function () { dragging = false; }, { passive: true });
+    layer.addEventListener('touchcancel', function () { dragging = false; }, { passive: true });
   }
 
   // -------------------------------------------------- 文本层同步
+
+  var NON_ASCII = /[^\x20-\x7e]/;
+
+  // 把一行写进文本层的一个 div。纯 ASCII 走快路径；含中文等宽字符时逐格输出，
+  // 非 ASCII 单元格包进固定宽度的 span，保证选区和 xterm 里的格子一一对应。
+  function fillRow(el, line, t) {
+    var text = line ? line.translateToString(true) : '';
+    if (el._key === text) return;
+    el._key = text;
+
+    if (!text || !NON_ASCII.test(text) || !(t.cellW > 0)) {
+      el.textContent = text;
+      return;
+    }
+
+    if (!t.cell) t.cell = t.term.buffer.active.getNullCell();
+    var items = [];
+    var n = line.length;
+    for (var x = 0; x < n; x++) {
+      var c = line.getCell(x, t.cell);
+      if (!c) break;
+      var w = c.getWidth();
+      if (w === 0) continue;            // 宽字符的后半格
+      items.push({ ch: c.getChars() || ' ', w: w });
+    }
+    while (items.length && items[items.length - 1].ch === ' ') items.pop();
+
+    var frag = document.createDocumentFragment();
+    var run = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var code = it.ch.length === 1 ? it.ch.charCodeAt(0) : -1;
+      if (it.w === 1 && code >= 0x20 && code <= 0x7e) {
+        run += it.ch;
+      } else {
+        if (run) { frag.appendChild(document.createTextNode(run)); run = ''; }
+        var sp = document.createElement('span');
+        sp.className = 'tl-wide';
+        sp.style.width = (it.w * t.cellW) + 'px';
+        sp.textContent = it.ch;
+        frag.appendChild(sp);
+      }
+    }
+    if (run) frag.appendChild(document.createTextNode(run));
+    el.textContent = '';
+    el.appendChild(frag);
+  }
 
   function syncTextLayer(rawId) {
     const id = String(rawId);
     const t = terms.get(id);
     if (!t || !t.layer) return;
+    if (!t.div.classList.contains('active')) return;   // 隐藏的终端不用同步，切过去时会重建
 
-    // 用户正在选择时不打断
-    try {
-      if (window.getSelection().toString().length > 0) return;
-    } catch (e) {}
+    // 用户正在选择时不打断；选区清掉后由 selectionchange 补一次
+    if (hasSelection()) return;
 
     const term = t.term;
 
-    if (t.cols !== term.cols || t.rows !== term.rows) {
+    // 行列变了，或渲染器后来才测量出真实格子尺寸 → 重建
+    const d = getCellDims(term);
+    if (t.cols !== term.cols || t.rows !== term.rows ||
+        (d && (Math.abs(d.w - t.cellW) > 0.01 || Math.abs(d.h - t.lineHeight) > 0.01))) {
       buildLayer(id);
     }
 
     const buf = term.buffer.active;
     const viewportY = buf.viewportY;
     for (let r = 0; r < term.rows; r++) {
-      const line = buf.getLine(viewportY + r);
-      const text = line ? line.translateToString(true) : '';
       const el = t.rowEls[r];
-      if (el && el.textContent !== text) {
-        el.textContent = text;
-      }
+      if (el) fillRow(el, buf.getLine(viewportY + r), t);
     }
   }
+
+  // 同一帧内的多次触发合并成一次
+  function scheduleSync(rawId) {
+    const id = String(rawId);
+    const t = terms.get(id);
+    if (!t || t.syncQueued) return;
+    t.syncQueued = true;
+    requestAnimationFrame(function () {
+      t.syncQueued = false;
+      syncTextLayer(id);
+    });
+  }
+
+  // 选区被取消后，补上选择期间被跳过的同步
+  document.addEventListener('selectionchange', function () {
+    if (activeId === null) return;
+    if (!hasSelection()) scheduleSync(activeId);
+  });
 
   // -------------------------------------------------- 输出
 
@@ -289,8 +381,7 @@
     const s = atob(b64);
     const u = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
-    t.term.write(u);
-    setTimeout(function () { syncTextLayer(rawId); }, 0);
+    t.term.write(u);          // onWriteParsed 会触发 scheduleSync
   }
 
   function pasteActive(text) {
@@ -299,19 +390,7 @@
     if (t) t.term.paste(text);
   }
 
-  // ★ 一个按钮搞定：有选中就复制选中，没选中就复制全屏
-  function copySelectionOrAll() {
-    let sel = '';
-    try { sel = window.getSelection().toString(); } catch (e) {}
-    if (sel) { call('onSelection', sel); return; }
-    if (activeId === null) { call('onToast', '没有终端'); return; }
-    const t = terms.get(activeId);
-    if (!t) return;
-    const all = t.layer ? (t.layer.innerText || t.layer.textContent || '') : '';
-    if (all) call('onSelection', all);
-    else call('onToast', '没有内容');
-  }
-
+  // 方向键：按终端当前的 application cursor 模式选 ESC O / ESC [
   function arrowActive(c) {
     if (activeId === null) return;
     const t = terms.get(activeId);
@@ -330,7 +409,7 @@
     try { t.term.options.fontSize = s; } catch (e) {}
     try { t.fit.fit(); } catch (e) {}
     buildLayer(activeId);
-    syncTextLayer(activeId);
+    scheduleSync(activeId);   // 渲染器重新测量后 syncTextLayer 会发现尺寸变化并再重建一次
     call('resize', activeId, t.term.cols, t.term.rows);
   }
 
