@@ -384,20 +384,21 @@
     t.term.write(u);          // onWriteParsed 会触发 scheduleSync
   }
 
-  function pasteActive(text) {
-    if (activeId === null) return;
-    const t = terms.get(activeId);
-    if (t) t.term.paste(text);
-  }
-
-  // 方向键：按终端当前的 application cursor 模式选 ESC O / ESC [
-  function arrowActive(c) {
+  // 方向键：mod 为 0 时按终端当前 application cursor 模式选 ESC O / ESC [；
+  // mod > 1 表示带修饰（1 + Shift + Alt*2 + Ctrl*4），必须用 CSI 参数形式
+  function arrowActive(c, mod) {
     if (activeId === null) return;
     const t = terms.get(activeId);
     if (!t) return;
-    var app = t.term.modes.applicationCursorKeysMode;
-    if (app === undefined) app = t.term.modes.applicationCursorKeys;
-    call('key', activeId, (app ? '\x1bO' : '\x1b[') + c);
+    var prefix;
+    if (mod && mod > 1) {
+      prefix = '\x1b[1;' + mod;
+    } else {
+      var app = t.term.modes.applicationCursorKeysMode;
+      if (app === undefined) app = t.term.modes.applicationCursorKeys;
+      prefix = app ? '\x1bO' : '\x1b[';
+    }
+    call('key', activeId, prefix + c);
   }
 
   function fontDeltaActive(d) {
