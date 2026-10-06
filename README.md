@@ -6,12 +6,12 @@ Mobile Deb 是一个面向 Android 的开源 Debian 运行环境，无需 Root�
 
 功能
 
-- 运行 Debian ARM64
-- 提供内置终端
-- 与 Android 共享文件
-- 基于 PRoot 运行，无需 Root
-- 支持安装和使用 Debian 软件包
-- 免费、开源
+- 🐧 运行 Debian ARM64
+- 💻 提供内置终端
+- 📂 与 Android 共享文件
+- 🔧 基于 PRoot 运行，无需 Root
+- 📦 支持安装和使用 Debian 软件包
+- 🔓 免费、开源
 
 用途
 
@@ -24,14 +24,6 @@ Mobile Deb 可以让你的 Android 手机拥有一个便携的 Debian 环境。
 - 编写和运行程序
 - 管理文件
 - 搭建自己的移动开发环境
-
-简单来说：
-
-«把 Debian 带在口袋里。»
-
-开源
-
-Mobile Deb 是自由、开源软件。
 
 本项目采用 GPLv3 开源许可证。
 
