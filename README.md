@@ -2,7 +2,7 @@ Mobile Deb
 
 在 Android 上运行 Debian。
 
-Mobile Deb 是一个面向 Android 的开源 Debian 运行环境，无需 Root，即可在手机上使用 Debian ARM64 用户空间。
+Mobile Deb 是一个基于Proot的，面向 Android 的开源 Debian 运行环境，无需 Root，即可在手机上使用 Debian ARM64 用户空间。
 
 功能
 
